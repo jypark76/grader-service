@@ -1,14 +1,13 @@
-# In plain English: gives the service a fixed internal address,
-# "knowledge-service:8000", that other things inside the cluster can use. It has
-# no outside port, so nothing outside the cluster can reach it directly.
+# In plain English: gives the grader a steady address INSIDE the cluster. There is no outside port, so
+# nothing outside the cluster can reach it directly. The grader's web side only answers the health checks.
 apiVersion: v1
 kind: Service
 metadata:
-  name: knowledge-service
-  namespace: knowledge
+  name: grader-service
+  namespace: grader
 spec:
   selector:
-    app: knowledge-service
+    app: grader-service
   ports:
     - port: 8000
       targetPort: 8000

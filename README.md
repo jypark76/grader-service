@@ -1,220 +1,81 @@
-# Knowledge service
+# Grader service
 
-The memory of past grading for an AI assessment grader. It is one small
-service in a larger set of microservices, built in Python and meant to run on
-Kubernetes.
+The AI Assessment Grader's grading worker, rebuilt as one small Python microservice. It will take
+grading jobs off Kafka, look up similar graded examples from the knowledge service, ask a grading
+model for a grade, and put the result back on Kafka. **Right now it is only the secure baseline:**
+no Kafka, no model, no grading yet. Those arrive in later steps, each with its own tests.
 
-**Status: work in progress.** The API, the tests and the local Kubernetes setup
-exist. The AWS setup (RDS, ECR, EKS) is not written yet.
+## What it does today
 
-## What it does
-
-1. **Stores approved examples.** After an instructor approves a grade, the
-   example (student work, grade and reasoning) is saved here along with an
-   embedding, a list of 384 numbers describing what the text is about.
-2. **Finds similar examples.** Given a new piece of student work, it returns
-   the past examples closest in meaning, so grading stays consistent.
-
-## What it owns
-
-Its own Postgres database with the pgvector extension and a single
-`examples` table. No other service reads that database directly. Other
-services ask this service through its API.
-
-The setup lives in [`db/init.sql`](db/init.sql). The table holds an example ID,
-an assignment ID (a plain reference to another service), the student work, the
-grade, the reasoning, the embedding and a timestamp. It stores no student
-names.
-
-## Changing the database
-
-`db/init.sql` builds the first version of the table, once, on an empty database. Every
-change after that is a numbered file in [`db/changelog`](db/changelog), applied by
-Liquibase (a free tool that applies database changes in order and remembers which
-ones it has applied). The root list [`changelog-root.yaml`](db/changelog/changelog-root.yaml)
-names the files in order. Never edit a change that has already been applied. Add the
-next numbered file and list it. A test checks that every file is on the list.
-
-On every deploy, a one-time job (`k8s/base/migrate-job.yaml`) runs Liquibase as the
-database admin, with the password from the Kubernetes Secret, and applies only the
-changes that are missing. If they are all applied it does nothing. The service's own
-login still cannot change tables. `deploy.sh` deploys in two steps. First everything
-except the service, including the migration job. Then it waits for the job, and only
-when the database changes are done does it roll out the service, so a new version never
-starts on an old table. If a change fails, the script stops within a few minutes, prints
-the job's log from every attempt, and leaves the running service untouched. A failed
-retry of the job stays as its own pod so the log can still be read.
-
-`bash db/check-upgrade.sh` proves an upgrade on a throwaway database that already
-holds an example: the example survives, the new rule works, and a second run changes
-nothing. The pipeline runs it on every pull request.
-
-Change 0001 adds `source_submission_id`: a label saying which submission an example
-came from, with a rule that two examples cannot share one. Examples saved before it,
-and examples saved without a label, have none, and any number of those can exist.
-
-## The service key
-
-Every route except `GET /health` and `GET /ready` needs the header `Authorization: Bearer <key>`. The key is one long
-secret shared with the trusted callers (the other services). It lives in the Kubernetes Secret
-`knowledge-service-key` (made by hand, never in this repo) and reaches the web pod as the setting `SERVICE_KEYS`. The
-Kafka reader does not call the routes, so it does not get the key.
-
-- A missing or wrong key answers 401 with the same fixed reply every time. It never says what was wrong and never
-  repeats what was sent. The documentation pages are closed too.
-- If no usable key is configured the service answers 503 on every protected route. It never opens up.
-- A key shorter than 32 characters is not usable. Make one with `openssl rand -hex 32`.
-- The setting may list several keys separated by commas. To replace a key without downtime: add the new one next to the
-  old, switch the callers to it, then remove the old one.
-- New routes are protected by default. A test finds every route by asking the app, so a route added later cannot be
-  forgotten.
-
-One shared key says "a trusted caller", not "which person", and it travels as plain HTTP inside the cluster on the
-laptop. Real user login comes later.
-
-## API
-
-| Call | What it does |
+| Address | Answer |
 |---|---|
-| `POST /examples` | Save an approved example and compute its embedding. It may carry an optional `source_submission_id`, a label for the submission it came from. A new example answers 201. The same labelled example sent again (for example a message delivered twice) answers 200 with the original's ID and saves nothing. A label already used by a different example answers 409. Without a label every call saves a new row, as before |
-| `GET /examples?assignment_id=...` | List the examples for one assignment (newest first, up to 100) |
-| `POST /examples/search` | Return the examples most similar in meaning to some text. It searches inside the assignment. If the assignment has no examples at all it returns nothing, unless the caller sets `fallback_to_all` to `true`, which borrows similar examples from every assignment. The flag is off by default, which protects against typos and accidents. It is not a security control, because it travels in the same request and any holder of the service key can set it. Each result carries its `assignment_id` and a `same_assignment` flag, so the caller can tell borrowed examples from the assignment's own |
-| `GET /health` | Report whether the service is alive |
-| `GET /ready` | Report whether the service can reach its database |
+| `GET /health` | `{"ok": true}` while the process is alive |
+| `GET /ready` | `{"ok": true}` when the grader is ready to work, otherwise a plain 503 |
 
-Bad input is refused with a 422 that names the field and the reason but never
-repeats what the caller sent.
+There are no other routes. The automatic documentation pages are switched off. Nothing in the
+cluster can ask the grader to do anything over HTTP, because it does its work from Kafka.
 
-An example's limits are 20,000 characters of student work, 100 of grade and 10,000 of
-reasoning. They are the same limits as in the agreed message format for approved examples
-(`platform/contracts/approved-examples.md`), and a test checks them against that table.
-The sender must never accept more than these.
+## Decisions that shape this service
 
-A repeat of a labelled example is recognised before the slow step (turning the essay
-into 384 numbers), so it costs almost nothing. If two copies arrive at the same instant,
-the database itself lets only one row for a label exist, and the other request looks
-again and answers as a repeat (or 409 if the content differs). Tests cover a planted
-collision and eight identical saves at once.
+- **No database.** The grader is stateless: jobs and results travel over Kafka. A test fails if a
+  database library, a SQL file or a `db/` folder ever appears (`tests/test_no_database.py`).
+- **No AI and no AWS yet.** The first model call will be to a fake provider. Bedrock comes after
+  that, through one AWS role that may call only `InvokeModel` on one model in one region, with a
+  monthly spending alarm, and its credentials mounted as a file.
+- **No outbound connections yet.** When the knowledge-service lookup and Kafka are added they are
+  added to the reviewed list in `tests/test_fixed_destinations.py` on purpose.
 
-## The Kafka reader
+## Security guardrails
 
-Approved examples also arrive on the Kafka topic `approved-examples`. A second program,
-[`app/consumer.py`](app/consumer.py), reads them. It runs as its own Deployment
-(`knowledge-consumer`) from the same image, started with `python -m app.consumer`, and has no
-web port. The message format is the shared contract in `platform/contracts/approved-examples.md`.
+Every guardrail is a test that runs on every pull request. Each test is tagged with the OWASP
+Top 10:2025 weaknesses (CWEs) it proves, and `expected-coverage.txt` lists the weaknesses this repo
+claims. The pipeline fails if a claimed weakness has no passing test, or a test is tagged with a
+weakness that is not claimed. The written design rules, each tied to a named test, are in
+[`docs/design-rules.md`](docs/design-rules.md).
 
-- A good new message is saved with the same routine as `POST /examples`. A repeat is recognised
-  by its `source_submission_id` and saves nothing.
-- A message is marked done only AFTER it has been dealt with, so a crash never loses one.
-- A message that can never succeed (not JSON, unknown version, a broken rule, key not equal to the
-  label, label already used by a different example, or a save the database refuses for that message alone) is copied to `approved-examples.dead-letter`
-  with the reason in an `error` header, and then marked done so it cannot block its lane. A person
-  has to look at the dead-letter topic; nothing reads it automatically.
-- Temporary trouble (database or Kafka down) commits nothing; the reader stops and Kubernetes
-  restarts it, and the message is read again.
-- No student text is written to the logs.
+| Guardrail | Test file |
+|---|---|
+| The exact list of routes, docs closed, odd address spellings | `tests/test_routes.py` |
+| Fixed error replies and safe log lines | `tests/test_error_handling.py`, `tests/test_error_handling_rules.py` |
+| Replies labelled JSON, no request text in reply headers | `tests/test_replies.py` |
+| No shell, eval or object loading; no file access; no uploads | `tests/test_forbidden_calls.py`, `tests/test_no_file_access.py`, `tests/test_no_file_uploads.py` |
+| Only reviewed cryptography | `tests/test_cryptography_rules.py` |
+| Settings fixed at deploy time, nothing identifies a caller except a key | `tests/test_configuration_rules.py`, `tests/test_identity_rules.py` |
+| Secrets read only from mounted files under `/etc/secrets` | `tests/test_secret_files.py` |
+| No secret in any repo file | `tests/test_no_secrets_in_the_repo.py` |
+| Locked, hash-checked libraries, pinned base image and Actions | `tests/test_dependency_lock.py`, `tests/test_supply_chain_pins.py`, `tests/test_image_pins.py` |
+| Hardened, internal-only pods | `tests/test_pod_hardening.py`, `tests/test_internal_only.py`, `tests/test_k8s_manifests.py` |
+| Wrong arguments caught before the program runs (mypy) | `tests/test_type_checking.py` |
 
-Limits: the tests use a pretend Kafka (the real one is proven on the cluster by hand); there is one
-reader; connections on the laptop are plain, with no login.
+Dependency and image scanning run in `.github/workflows/dependency-audit.yml` and
+`.github/workflows/image-scan.yml`, and Dependabot proposes updates (`.github/dependabot.yml`).
+
+## Running it
+
+```
+docker build -t grader-service .
+docker run --rm -p 8000:8000 grader-service
+```
+
+On the laptop cluster: `bash k8s/deploy.sh` (it looks at which cluster `kubectl` points at and
+refuses anything it does not recognise). `bash k8s/deploy.sh --preview` only prints what it would
+deploy.
 
 ## Tests
 
 ```
-python -m venv .venv
-.venv/Scripts/pip install -r requirements-dev.txt
-.venv/Scripts/python -m pytest -v
+pip install --require-hashes -r requirements-dev.txt
+pytest -v --ignore=tests/test_k8s_manifests.py
 ```
 
-The same tests run on every pull request, and the `main` branch rules require
-them to pass before a merge.
-
-The pipeline also builds the Docker image and starts it with the network off, then checks
-`/health`, that `/ready` fails safely with no database, that the model is inside the image,
-that it runs as user 1000 and that only the code, the model and the list of libraries are in `/app`.
-
-`tests/test_k8s_manifests.py` builds the Kubernetes files for the laptop settings and
-checks them against our rules (namespace, no Secret, fixed image tags, a locked-down
-service pod and more). It needs `kubectl` and is skipped without it. Its self-tests
-feed it deliberately broken files, so it cannot pass by never complaining.
-
-`tests/test_database.py` needs a real database and is skipped when none is
-configured. In the pipeline it runs against a throwaway Postgres that is built
-from `db/init.sql` and the first-start password script, then destroyed. The
-service login cannot delete, so these tests leave rows behind and refuse to run
-unless the database is named `knowledge_test`. To run them yourself, start a
-temporary container (use any passwords you like) and point the settings at it:
-
-```
-# In Git Bash on Windows, put MSYS_NO_PATHCONV=1 before "docker run". Without it
-# Git Bash rewrites the folder paths and the setup scripts are never found.
-docker run -d --name test-db \
-  -e POSTGRES_PASSWORD=admin -e POSTGRES_DB=knowledge_test -e APP_PASSWORD=app \
-  -v "$PWD/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
-  -v "$PWD/k8s/overlays/local/set-app-password.sh:/docker-entrypoint-initdb.d/02-set-app-password.sh:ro" \
-  -p 5432:5432 pgvector/pgvector:0.8.7-pg17
-
-# wait about 20 seconds for the database to finish setting itself up, then:
-DB_HOST=localhost DB_NAME=knowledge_test DB_USER=knowledge_app DB_PASSWORD=app \
-  .venv/Scripts/python -m pytest -v tests/test_database.py
-
-docker rm -f test-db
-```
-
-## Running on Kubernetes
-
-The cluster files live in `k8s/`:
-
-- `k8s/base/` holds what every environment shares (the Deployment and Service).
-- `k8s/overlays/local/` holds the laptop settings, including a Postgres pod.
-- `k8s/deploy.sh` looks at which cluster `kubectl` points at and applies the
-  matching settings. It refuses any cluster it does not recognise.
-
-```
-bash k8s/deploy.sh --preview   # show what would be deployed
-bash k8s/deploy.sh             # deploy
-```
-
-First time on a cluster: create the Secret by hand (the script prints the
-command), then run `deploy.sh`. On its first start the database sets itself up
-from `db/init.sql` and gives the `knowledge_app` login its password from the
-Secret. To start the database from scratch:
-
-```
-kubectl delete -n knowledge deployment/knowledge-db pvc/knowledge-db-data
-bash k8s/deploy.sh
-```
-
-The embedding model loads on the first save or search call, not at startup, so
-the first call is slower. If it is ever preloaded at startup, add a
-`startupProbe` to the Deployment so a slow start is not mistaken for a crash.
-
-The database pod has a NetworkPolicy (`k8s/overlays/local/networkpolicy.yaml`) that
-allows only the service pod and the one-time migration job to connect. It is written but not verified: Docker
-Desktop's built-in cluster does not enforce NetworkPolicy, so a wrong pod still gets
-through there. It has to be tested on a cluster that enforces policies.
-
-On AWS the database is RDS, so the Postgres pod is not used there.
-
-## Starting a new service from this repo
-
-This repo is the template for the other microservices. See [`NEW_SERVICE.md`](NEW_SERVICE.md)
-for the rename command, what to rewrite, the one-time GitHub setup and the order of work.
+The Kubernetes file checks (`tests/test_k8s_manifests.py`) need `kubectl` and run in their own
+pipeline job. To regenerate a lock file after editing its `.in` file, use the command written at the
+top of the `.in` file (it needs Docker).
 
 ## Known limits
 
-- The `fallback_to_all` flag guards against typos and accidents, not against a caller who wants the data. It travels in the same request, so any caller that holds the service key can set it with any assignment ID and read other assignments' examples. The service key limits who can call at all; it does not limit which assignment a caller may read. Real protection needs per-caller rules, or the caller checking that the assignment exists. The service is internal-only for now.
-- Search uses pgvector's HNSW index with iterative scan switched on, which stops
-  after 20000 scanned rows (`hnsw.max_scan_tuples`). A small assignment hidden
-  behind tens of thousands of closer examples from other assignments could still
-  return too few results. Nothing near that size exists today.
-- The NetworkPolicy is written but not verified, because Docker Desktop's
-  built-in cluster does not enforce it.
-
-## Security notes
-
-- This repo is public. It never contains passwords, API keys or Kubernetes
-  Secret files, not even templates.
-- The service's database login can read and add examples but cannot update or
-  delete them.
-- The database passwords live only in a Kubernetes Secret that is created by
-  hand with a command. They are never written into any file.
+- No Kafka, no knowledge-service lookup, no model: the service does not grade anything yet.
+- No inbound keys: with no business routes there is nothing to protect with a key. The first inbound
+  route, if one is ever added, must come with its own key check and permission tests.
+- TLS, encryption of stored data and Kafka login wait for the AWS step, the same as the other
+  services.

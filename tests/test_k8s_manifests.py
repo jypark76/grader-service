@@ -10,6 +10,7 @@ import copy
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 OVERLAY = ROOT / "k8s" / "overlays" / "local"
 DEPLOY_SCRIPT = ROOT / "k8s" / "deploy.sh"
 
-NAMESPACE = "knowledge"
+NAMESPACE = "grader"
 
 # Kinds that do not live inside a namespace.
 CLUSTER_WIDE = {"Namespace"}
@@ -29,18 +30,10 @@ CLUSTER_WIDE = {"Namespace"}
 WORKLOADS = {"Deployment", "Job"}
 
 # The pods that must run locked down: a normal user, no extra privileges.
-LOCKED_DOWN = {"knowledge-service", "knowledge-consumer", "knowledge-migrate"}
+LOCKED_DOWN = {"grader-service"}
 
-# Things the pods point at that are NOT in the rendered files on purpose:
-# "knowledge-db-init" is made by deploy.sh from db/init.sql, "knowledge-db-changelog"
-# is made by deploy.sh from the db/changelog folder, and the Secret "knowledge-db"
-# is created by hand and never stored in the repo.
-MADE_OUTSIDE = {
-    ("ConfigMap", "knowledge-db-init"),
-    ("ConfigMap", "knowledge-db-changelog"),
-    ("Secret", "knowledge-db"),
-    ("Secret", "knowledge-service-key"),
-}
+# Things the pods point at that are NOT in the rendered files on purpose. None yet: the grader has no secrets.
+MADE_OUTSIDE: set = set()
 
 
 # In plain English: builds the final Kubernetes files for the laptop settings and
@@ -58,6 +51,32 @@ def render_overlay():
 # In plain English: gives every container in a Deployment, whatever its name.
 def containers_of(deployment):
     return deployment["spec"]["template"]["spec"].get("containers", [])
+
+
+# In plain English: checks that a secret reaches a container as a mounted FILE and not as an environment variable.
+# "setting" is the name the code uses (for example DB_PASSWORD). The container must have no setting by that name,
+# must have SETTING_FILE pointing into /etc/secrets, and that path must be a read-only mount of exactly the named
+# Secret and key.
+def assert_secret_file(docs, container, setting, secret_name, key):
+    env = {item["name"]: item for item in container.get("env", [])}
+    assert setting not in env, f"{setting} must not be an environment variable"
+    file_setting = env[f"{setting}_FILE"]
+    assert "valueFrom" not in file_setting
+    path = file_setting["value"]
+    folder, _, file_name = path.rpartition("/")
+    assert path.startswith("/etc/secrets/") and file_name == key, path
+    owner = next(d for d in docs if d["kind"] in ("Deployment", "Job", "StatefulSet") and any(c is container for c in containers_of(d)))
+    volumes = {volume["name"]: volume for volume in owner["spec"]["template"]["spec"].get("volumes", [])}
+    mount = next(m for m in container["volumeMounts"] if m["mountPath"] == folder)
+    assert mount.get("readOnly") is True
+    secret = volumes[mount["name"]]["secret"]
+    assert secret["secretName"] == secret_name
+    assert secret["items"] == [{"key": key, "path": key}]
+
+
+# In plain English: a setting such as DB_PASSWORD_FILE holds the PATH of a mounted Secret file, not a password.
+def is_secret_file_setting(env):
+    return env["name"].endswith("_FILE") and str(env.get("value", "")).startswith("/etc/secrets/")
 
 
 # In plain English: lists every ConfigMap and Secret that a Deployment points at,
@@ -136,7 +155,7 @@ def find_problems(docs):
             # Rule 8: a password is never written as a plain value in the files. It
             # has to come from a Secret, because this repo is public.
             for env in container.get("env", []):
-                if "PASSWORD" in env["name"].upper() and "valueFrom" not in env:
+                if "PASSWORD" in env["name"].upper() and "valueFrom" not in env and not is_secret_file_setting(env):
                     problems.append(f"{label}: {env['name']} must come from a Secret, not a written value")
 
         # Rule 7: every ConfigMap or Secret a pod points at must exist in the
@@ -185,11 +204,9 @@ def real_docs():
 # checks the render really produced our objects, so an empty result can never pass.
 def test_real_overlay_breaks_no_rules(real_docs):
     kinds = {(doc["kind"], doc["metadata"]["name"]) for doc in real_docs}
-    assert ("Deployment", "knowledge-service") in kinds
-    assert ("Deployment", "knowledge-consumer") in kinds
-    assert ("Deployment", "knowledge-db") in kinds
-    assert ("NetworkPolicy", "knowledge-db-allow-service-only") in kinds
-    assert ("Job", "knowledge-migrate") in kinds
+    assert ("Deployment", "grader-service") in kinds
+    assert ("Service", "grader-service") in kinds
+    assert ("Namespace", "grader") in kinds
     assert find_problems(real_docs) == []
 
 
@@ -197,83 +214,6 @@ def test_real_overlay_breaks_no_rules(real_docs):
 # the "bit bucket". That once made a real error look like "Secret missing".
 def test_deploy_script_does_not_hide_errors():
     assert "/dev/null" not in DEPLOY_SCRIPT.read_text(encoding="utf-8")
-
-
-# In plain English: the migration job logs in to the database as the admin, so its
-# password must come from the Kubernetes Secret, never from a value written in the
-# files. It must also really run Liquibase's "update", which applies only the
-# changes that are missing and does nothing when there are none.
-def test_the_migration_job_gets_its_password_from_the_secret_and_runs_update(real_docs):
-    job = next(doc for doc in real_docs if doc["kind"] == "Job" and doc["metadata"]["name"] == "knowledge-migrate")
-    container = containers_of(job)[0]
-    env = {item["name"]: item for item in container.get("env", [])}
-    password = env["LIQUIBASE_COMMAND_PASSWORD"]
-    assert "value" not in password
-    assert password["valueFrom"]["secretKeyRef"] == {"name": "knowledge-db", "key": "postgres-password"}
-    assert container["args"][-1] == "update"
-
-
-# In plain English: the database only lets labelled pods connect to it. The
-# migration job must carry a label the door rule accepts, or it could never reach
-# the database on a cluster that enforces the rule.
-def test_the_database_door_lets_the_migration_job_in(real_docs):
-    job = next(doc for doc in real_docs if doc["kind"] == "Job" and doc["metadata"]["name"] == "knowledge-migrate")
-    assert job["spec"]["template"]["metadata"]["labels"]["app"] == "knowledge-migrate"
-    policy = next(doc for doc in real_docs if doc["kind"] == "NetworkPolicy")
-    allowed = [
-        source["podSelector"]["matchLabels"]["app"]
-        for rule in policy["spec"]["ingress"]
-        for source in rule["from"]
-    ]
-    assert "knowledge-migrate" in allowed
-    assert "knowledge-service" in allowed
-    assert "knowledge-consumer" in allowed
-
-
-# In plain English: the deploy script must hand the change files to the cluster and
-# clear out the old migration job first (a job cannot be changed after it is made).
-def test_deploy_script_hands_over_the_changes_and_clears_the_old_job():
-    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
-    assert "knowledge-db-changelog" in script
-    assert "kubectl delete job knowledge-migrate" in script
-
-
-# In plain English: the service must roll out only AFTER the database changes are
-# done. Otherwise a new service version could start on the old table, and if the
-# migration failed the new version would already be live. The Deployment carries a
-# label so the script can pick it out. The script applies everything else first, waits
-# for the migration, and only then applies the service and the reader. Nothing else may carry the
-# label, or it too would wait.
-def test_the_service_rolls_out_only_after_the_migration(real_docs):
-    labelled = [
-        doc["metadata"]["name"]
-        for doc in real_docs
-        if doc["metadata"].get("labels", {}).get("deploy-phase") == "service"
-    ]
-    assert sorted(labelled) == ["knowledge-consumer", "knowledge-service"]
-    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
-    everything_else_first = script.index("deploy-phase!=service")
-    wait_for_the_migration = script.index("\nwait_for_migration\n")
-    the_service_last = script.index("deploy-phase=service")
-    assert everything_else_first < wait_for_the_migration < the_service_last
-
-
-# In plain English: a failed migration must be reported as soon as it fails, with its
-# log. "kubectl wait" cannot do that: it only stops early on success, so a failure shows
-# up after the whole timeout. The script looks at the job's own state instead.
-def test_a_failed_migration_is_reported_without_waiting_for_a_timeout():
-    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
-    assert "kubectl wait" not in script
-    assert "Failed" in script
-    assert "kubectl logs -l job-name=knowledge-migrate" in script
-
-
-# In plain English: the job's own retries must run out before the script stops
-# waiting, or the script would give up on a job that is still trying. Four retries
-# wait about 2.5 minutes in total, well inside the script's 10 minutes.
-def test_the_migration_job_gives_up_before_the_deploy_script_does(real_docs):
-    job = next(doc for doc in real_docs if doc["kind"] == "Job" and doc["metadata"]["name"] == "knowledge-migrate")
-    assert job["spec"]["backoffLimit"] <= 4
 
 
 # ---------------------------------------------------------------------------
@@ -289,32 +229,27 @@ def good_docs():
         {
             "kind": "ConfigMap",
             "metadata": {"name": "settings", "namespace": NAMESPACE},
-            "data": {"DB_HOST": "knowledge-db"},
+            "data": {"MODE": "plain"},
         },
         {
             "kind": "Service",
-            "metadata": {"name": "knowledge-service", "namespace": NAMESPACE},
+            "metadata": {"name": "grader-service", "namespace": NAMESPACE},
             "spec": {"ports": [{"port": 8000}]},
         },
         {
             "kind": "Deployment",
-            "metadata": {"name": "knowledge-service", "namespace": NAMESPACE},
+            "metadata": {"name": "grader-service", "namespace": NAMESPACE},
             "spec": {
                 "template": {
                     "spec": {
                         "securityContext": {"runAsNonRoot": True, "runAsUser": 1000},
                         "containers": [
                             {
-                                "name": "knowledge-service",
-                                "image": "knowledge-service:0.4.0",
+                                "name": "grader-service",
+                                "image": "grader-service:0.4.0",
                                 "envFrom": [{"configMapRef": {"name": "settings"}}],
-                                "env": [
-                                    {
-                                        "name": "DB_PASSWORD",
-                                        "valueFrom": {"secretKeyRef": {"name": "knowledge-db", "key": "app-password"}},
-                                    }
-                                ],
-                                "resources": {"limits": {"memory": "1Gi"}},
+                                "env": [],
+                                "resources": {"limits": {"memory": "256Mi"}},
                                 "securityContext": {
                                     "allowPrivilegeEscalation": False,
                                     "capabilities": {"drop": ["ALL"]},
@@ -322,36 +257,6 @@ def good_docs():
                             }
                         ],
                     }
-                }
-            },
-        },
-        {
-            "kind": "Job",
-            "metadata": {"name": "knowledge-migrate", "namespace": NAMESPACE},
-            "spec": {
-                "template": {
-                    "metadata": {"labels": {"app": "knowledge-migrate"}},
-                    "spec": {
-                        "securityContext": {"runAsNonRoot": True, "runAsUser": 1001},
-                        "containers": [
-                            {
-                                "name": "liquibase",
-                                "image": "liquibase/liquibase:4.31.1",
-                                "args": ["update"],
-                                "env": [
-                                    {
-                                        "name": "LIQUIBASE_COMMAND_PASSWORD",
-                                        "valueFrom": {"secretKeyRef": {"name": "knowledge-db", "key": "postgres-password"}},
-                                    }
-                                ],
-                                "resources": {"limits": {"memory": "768Mi"}},
-                                "securityContext": {
-                                    "allowPrivilegeEscalation": False,
-                                    "capabilities": {"drop": ["ALL"]},
-                                },
-                            }
-                        ],
-                    },
                 }
             },
         },
@@ -382,16 +287,17 @@ def test_catches_a_secret_in_the_repo():
 
 def test_catches_the_latest_tag():
     docs = good_docs()
-    containers_of(deployment_of(docs))[0]["image"] = "knowledge-service:latest"
+    containers_of(deployment_of(docs))[0]["image"] = "grader-service:latest"
     assert any("latest" in problem for problem in find_problems(docs))
 
 
 def test_catches_a_missing_tag():
     docs = good_docs()
-    containers_of(deployment_of(docs))[0]["image"] = "knowledge-service"
+    containers_of(deployment_of(docs))[0]["image"] = "grader-service"
     assert any("no version tag" in problem for problem in find_problems(docs))
 
 
+@pytest.mark.owasp("A01", 668)
 def test_catches_a_service_open_to_the_outside():
     docs = good_docs()
     docs[2]["spec"]["type"] = "NodePort"
@@ -417,6 +323,7 @@ def test_catches_a_name_mismatch_in_a_mounted_folder():
     assert any("scripts-1a2b3c" in problem for problem in find_problems(docs))
 
 
+@pytest.mark.owasp("A01", 276, 732)
 def test_catches_a_pod_that_may_run_as_root():
     docs = good_docs()
     deployment_of(docs)["spec"]["template"]["spec"]["securityContext"] = {}
@@ -425,6 +332,7 @@ def test_catches_a_pod_that_may_run_as_root():
     assert any("runAsUser" in problem for problem in problems)
 
 
+@pytest.mark.owasp("A01", 276, 732)
 def test_catches_privilege_escalation_and_kept_capabilities():
     docs = good_docs()
     security = containers_of(deployment_of(docs))[0]["securityContext"]
@@ -437,84 +345,34 @@ def test_catches_privilege_escalation_and_kept_capabilities():
 
 # In plain English: a thing made outside the files on purpose (the hand-made
 # Secret) must NOT be reported, or the checker would cry wolf on a healthy setup.
-def test_allows_the_things_made_outside_on_purpose():
+def test_allows_the_things_made_outside_on_purpose(monkeypatch):
+    # The grader has no such things yet; this proves the allowance works for the day one is added on purpose.
     docs = good_docs()
-    assert ("Secret", "knowledge-db") in references_of(deployment_of(docs))
+    containers_of(deployment_of(docs))[0]["env"] = [
+        {"name": "THING", "valueFrom": {"secretKeyRef": {"name": "thing-secret", "key": "value"}}}
+    ]
+    assert ("Secret", "thing-secret") in references_of(deployment_of(docs))
+    assert any("thing-secret" in problem for problem in find_problems(docs))
+    monkeypatch.setattr(sys.modules[__name__], "MADE_OUTSIDE", {("Secret", "thing-secret")})
     assert find_problems(docs) == []
-
-
-# In plain English: the rules must cover the migration job too, not only the
-# Deployments. A checker that skipped Jobs would let a bad migration job through.
-def job_of(docs):
-    return next(doc for doc in docs if doc["kind"] == "Job")
-
-
-def test_catches_a_problem_in_the_migration_job():
-    docs = good_docs()
-    containers_of(job_of(docs))[0]["image"] = "liquibase/liquibase:latest"
-    problems = find_problems(docs)
-    assert any("Job/knowledge-migrate" in problem and "latest" in problem for problem in problems)
-
-
-def test_catches_a_migration_job_that_may_run_as_root():
-    docs = good_docs()
-    job_of(docs)["spec"]["template"]["spec"]["securityContext"] = {}
-    problems = find_problems(docs)
-    assert any("Job/knowledge-migrate" in problem and "runAsNonRoot" in problem for problem in problems)
 
 
 # In plain English: a password must never be written as a plain value in the files.
 # It has to come from the Kubernetes Secret, because this repo is public.
+
+def test_a_secret_file_path_is_not_mistaken_for_a_written_password():
+    assert is_secret_file_setting({"name": "DB_PASSWORD_FILE", "value": "/etc/secrets/db/app-password"})
+
+
+def test_a_written_password_is_still_caught_even_if_it_is_named_like_a_file_setting():
+    assert not is_secret_file_setting({"name": "DB_PASSWORD_FILE", "value": "hunter2"})
+    assert not is_secret_file_setting({"name": "DB_PASSWORD_FILE", "value": "/tmp/x"})
+    assert not is_secret_file_setting({"name": "DB_PASSWORD", "value": "/etc/secrets/db/app-password"})
+    assert not is_secret_file_setting({"name": "DB_PASSWORD"})
+
+
 def test_catches_a_password_written_in_the_files():
     docs = good_docs()
-    containers_of(job_of(docs))[0]["env"] = [{"name": "LIQUIBASE_COMMAND_PASSWORD", "value": "hunter2"}]
+    containers_of(deployment_of(docs))[0]["env"] = [{"name": "SERVICE_PASSWORD", "value": "hunter2"}]
     problems = find_problems(docs)
     assert any("PASSWORD" in problem and "Secret" in problem for problem in problems)
-
-
-# In plain English: every retry of the migration job must be a NEW pod that stays
-# after it fails. With "OnFailure" Kubernetes restarts the container inside one pod
-# and deletes that pod when the retries run out, and the log goes with it. We found
-# that out in a real failure drill: the script could not show why the migration failed.
-def test_failed_migration_pods_are_kept_so_their_log_can_be_read(real_docs):
-    job = next(doc for doc in real_docs if doc["kind"] == "Job" and doc["metadata"]["name"] == "knowledge-migrate")
-    assert job["spec"]["template"]["spec"]["restartPolicy"] == "Never"
-
-
-# In plain English: the reader is its own Deployment from the SAME image as the web
-# service, started with a different command. It listens on no port, takes the database
-# password from the Secret (never from a written value), and gets the Kafka address
-# from the shared settings.
-def test_the_reader_runs_the_reader_code_from_the_same_image(real_docs):
-    service = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "knowledge-service")
-    reader = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "knowledge-consumer")
-    container = containers_of(reader)[0]
-    assert container["image"] == containers_of(service)[0]["image"]
-    assert container["command"] == ["python", "-m", "app.consumer"]
-    assert "ports" not in container
-    assert reader["spec"]["template"]["metadata"]["labels"]["app"] == "knowledge-consumer"
-    password = {item["name"]: item for item in container["env"]}["DB_PASSWORD"]
-    assert "value" not in password
-    assert password["valueFrom"]["secretKeyRef"] == {"name": "knowledge-db", "key": "app-password"}
-    settings = next(d for d in real_docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "knowledge-service-config")
-    assert settings["data"]["KAFKA_BOOTSTRAP"] == "kafka.kafka.svc.cluster.local:9092"
-    assert container["envFrom"] == [{"configMapRef": {"name": "knowledge-service-config"}}]
-
-
-# In plain English: the service key must reach the WEB service pod from the Kubernetes Secret
-# and never from a value written in the files, and the deploy script must stop with the create
-# command if that Secret does not exist yet. The Kafka reader does not call the routes, so it
-# must not hold the key.
-def test_the_service_key_comes_from_a_secret_never_from_the_files(real_docs):
-    service = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "knowledge-service")
-    reader = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "knowledge-consumer")
-    env = {item["name"]: item for item in containers_of(service)[0]["env"]}
-    key = env["SERVICE_KEYS"]
-    assert "value" not in key
-    assert key["valueFrom"]["secretKeyRef"] == {"name": "knowledge-service-key", "key": "keys"}
-    assert "SERVICE_KEYS" not in {item["name"] for item in containers_of(reader)[0]["env"]}
-    settings = next(d for d in real_docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "knowledge-service-config")
-    assert "SERVICE_KEYS" not in settings["data"]
-    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
-    assert "kubectl get secret knowledge-service-key" in script
-    assert "kubectl create secret generic knowledge-service-key" in script
