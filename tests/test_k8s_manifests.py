@@ -32,8 +32,9 @@ WORKLOADS = {"Deployment", "Job"}
 # The pods that must run locked down: a normal user, no extra privileges.
 LOCKED_DOWN = {"grader-service", "grader-worker"}
 
-# Things the pods point at that are NOT in the rendered files on purpose. None yet: the grader has no secrets.
-MADE_OUTSIDE: set = set()
+# Things the pods point at that are NOT in the rendered files on purpose: the Secret with the grader's key for the knowledge
+# service is created by hand and never stored in the repo.
+MADE_OUTSIDE = {("Secret", "knowledge-lookup-key")}
 
 
 # In plain English: builds the final Kubernetes files for the laptop settings and
@@ -390,8 +391,28 @@ def test_the_worker_runs_the_worker_code_from_the_same_image(real_docs):
     assert container["image"] == containers_of(service)[0]["image"]
     assert container["command"] == ["python", "-m", "app.worker"]
     assert container["envFrom"] == [{"configMapRef": {"name": "grader-service-config"}}]
-    assert "env" not in container
-    assert references_of(worker) == {("ConfigMap", "grader-service-config")}
+    assert references_of(worker) == {("ConfigMap", "grader-service-config"), ("Secret", "knowledge-lookup-key")}
+
+
+# In plain English: the grader's key for the knowledge service reaches the worker as a read-only mounted file (never an
+# environment variable), from exactly the named Secret and key, and the address of the knowledge service is a plain setting.
+@pytest.mark.owasp("A02", 526)
+@pytest.mark.owasp("A07", 798)
+def test_the_lookup_key_is_a_mounted_file_and_the_address_is_a_setting(real_docs):
+    worker = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "grader-worker")
+    assert_secret_file(real_docs, containers_of(worker)[0], "KNOWLEDGE_KEY", "knowledge-lookup-key", "key")
+    config = next(d for d in real_docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "grader-service-config")
+    assert config["data"]["KNOWLEDGE_URL"] == "http://knowledge-service.knowledge.svc.cluster.local:8000"
+    assert "KNOWLEDGE_KEY" not in config["data"]
+    web = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "grader-service")
+    assert not any(("secret" in volume) for volume in web["spec"]["template"]["spec"].get("volumes", []))
+
+
+# In plain English: the deploy script checks the key Secret exists and tells you the command if not. It never creates one.
+def test_the_deploy_script_checks_the_lookup_key_and_never_creates_it():
+    lines = [line.strip() for line in DEPLOY_SCRIPT.read_text(encoding="utf-8").splitlines()]
+    assert any(line.startswith("key_secret=") and "get secret knowledge-lookup-key" in line for line in lines)
+    assert not any(line.startswith("kubectl create secret") or line.startswith("kubectl apply -f - ") for line in lines)
 
 
 def test_the_worker_is_held_to_the_pod_rules():

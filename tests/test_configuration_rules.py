@@ -22,7 +22,7 @@ import pytest
 APP = Path(__file__).resolve().parent.parent / "app"
 
 # The only functions that may receive the whole environment: they read named settings from it and nothing else.
-SETTINGS_FUNCTIONS = {"consumer_settings", "producer_settings"}
+SETTINGS_FUNCTIONS = {"consumer_settings", "producer_settings", "make_client"}
 WRITING_METHODS = {"update", "setdefault", "pop", "popitem", "clear", "__setitem__", "__delitem__"}
 DUMPING_METHODS = {"items", "keys", "values", "copy", "__iter__"}
 XML_MODULES = {"xml", "lxml", "defusedxml", "xmlrpc", "xmltodict", "untangle", "elementtree"}

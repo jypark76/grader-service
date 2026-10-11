@@ -17,6 +17,10 @@ uvicorn==0.54.0
 # Pinned like the rest.
 confluent-kafka==2.16.0
 
+# The web client the lookup (app/lookup.py) uses to ask the knowledge service for similar graded examples. It is the
+# only outbound web connection the grader makes. Pinned like the rest (the same version the tests use).
+httpx==0.28.1
+
 # The tool that installs the libraries. It is pinned too, so the image never builds with whatever
 # version of pip the base image happened to ship.
 pip==26.2.1

@@ -23,8 +23,8 @@ class ProviderRefused(Exception):
     pass
 
 
-# In plain English: the fake grader. It always answers the same thing and never looks at the student's text, so it
-# cannot leak it and costs nothing.
+# In plain English: the fake grader. It always answers the same thing and never looks at the student's text or at the
+# similar examples it is handed, so it cannot leak them and costs nothing. (The real model will use the examples.)
 class FakeProvider:
-    def grade(self, job):
+    def grade(self, job, examples):
         return Grade("B", "Graded by the fake provider: no AI was used.")

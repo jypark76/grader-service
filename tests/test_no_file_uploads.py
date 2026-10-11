@@ -19,6 +19,9 @@ APP = Path(__file__).resolve().parent.parent / "app"
 BANNED_MODULES = {"multipart", "python_multipart", "aiofiles", "werkzeug", "cgi", "tempfile", "shutil", "zipfile", "tarfile"}
 BANNED_NAMES = {"UploadFile", "File", "Form", "FileResponse", "StaticFiles"}
 BANNED_METHODS = {"form", "stream"}  # request.form(), request.stream()
+# The one allowed use of ".stream(": the lookup streams the REPLY of its own outbound call so it can cap its size. It
+# is the web client's method, not a request body being read. Anything else, in any file, is still caught.
+ALLOWED_CALLS = {("lookup.py", "self.web.stream")}
 
 
 def find_problems(source, name="app/x.py"):
@@ -39,6 +42,8 @@ def find_problems(source, name="app/x.py"):
             if node.attr in BANNED_NAMES:
                 problems.append(f"{name}:{node.lineno}: uses '{node.attr}'")
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in BANNED_METHODS:
+            if (name.rsplit("/", 1)[-1], ast.unparse(node.func)) in ALLOWED_CALLS:
+                continue
             problems.append(f"{name}:{node.lineno}: reads a request as '{node.func.attr}()'")
     return problems
 
@@ -98,3 +103,14 @@ def test_every_bad_program_is_caught(label):
 @pytest.mark.parametrize("label", sorted(GOOD_PROGRAMS))
 def test_every_good_program_passes(label):
     assert find_problems(GOOD_PROGRAMS[label]) == [], f"wrongly flagged: {label}"
+
+
+@pytest.mark.owasp("A06", 434, 646)
+def test_the_one_allowed_stream_call_is_real_and_stays_narrow():
+    assert ALLOWED_CALLS == {("lookup.py", "self.web.stream")}
+    assert "self.web.stream(" in (APP / "lookup.py").read_text(encoding="utf-8")
+    call = "class A:\n    def f(self):\n        return self.web.stream('POST', P)\n"
+    assert find_problems(call, "app/lookup.py") == []
+    assert find_problems(call, "app/other.py") != []
+    assert find_problems(call.replace("self.web", "request"), "app/lookup.py") != []
+    assert find_problems(call.replace("self.web.stream", "self.web.form"), "app/lookup.py") != []

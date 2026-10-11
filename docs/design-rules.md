@@ -28,3 +28,8 @@ claim a rule that nothing checks. To add a rule, add the test first, then a row 
 | Done only after delivery | A message is committed only after its answer or dead-letter copy is confirmed delivered. | `tests/test_worker.py::test_a_good_job_sends_its_answer_to_the_results_topic_before_the_commit` |
 | Never lose a job | If an answer cannot be delivered, nothing is committed and the worker stops. | `tests/test_worker.py::test_an_answer_that_is_not_delivered_is_not_committed` |
 | No student text in logs | The log carries only the outcome and the offset. | `tests/test_worker.py::test_the_log_carries_only_the_outcome_and_the_offset` |
+| One fixed destination | The only outbound web call goes to one deploy-time address and one fixed path; nothing in a message can change it. | `tests/test_lookup.py::test_nothing_in_the_job_can_change_where_the_request_goes` |
+| No redirects | A redirect is never followed, so a reply cannot send the worker somewhere else. | `tests/test_lookup.py::test_a_real_redirect_to_another_server_is_not_followed` |
+| Untrusted replies | A reply from another service is size-capped and checked strictly; anything that does not fit is refused. | `tests/test_lookup.py::test_a_reply_that_does_not_follow_the_agreed_shape_is_refused` |
+| Lookup failure stops the worker | If the lookup fails, nothing is committed and the worker stops, so the job is retried. | `tests/test_worker.py::test_the_lookup_being_unavailable_means_no_commit_no_answer_and_the_loop_stops` |
+| Key never logged | Neither the key nor the student text reaches a log or an error. | `tests/test_lookup.py::test_neither_the_key_nor_the_student_text_ever_reaches_a_log_or_an_error` |

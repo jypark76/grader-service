@@ -2,8 +2,9 @@
 
 The AI Assessment Grader's grading worker, rebuilt as one small Python microservice. It will take
 grading jobs off Kafka, look up similar graded examples from the knowledge service, ask a grading
-model for a grade, and put the result back on Kafka. **Right now it is only the secure baseline:**
-no Kafka, no model, no grading yet. Those arrive in later steps, each with its own tests.
+model for a grade, and put the result back on Kafka. **Right now it reads jobs, looks up
+similar examples and sends results, but the grade comes from a FAKE provider:** there is no AI yet. The model arrives in a later
+step, with its own guardrails and tests.
 
 ## What it does today
 
@@ -22,8 +23,10 @@ cluster can ask the grader to do anything over HTTP, because it does its work fr
 - **No AI and no AWS yet.** The first model call will be to a fake provider. Bedrock comes after
   that, through one AWS role that may call only `InvokeModel` on one model in one region, with a
   monthly spending alarm, and its credentials mounted as a file.
-- **No outbound connections yet.** When the knowledge-service lookup and Kafka are added they are
-  added to the reviewed list in `tests/test_fixed_destinations.py` on purpose.
+- **One outbound web call.** The lookup (`app/lookup.py`) asks the knowledge service for similar graded examples with the
+  grader's own key. Its address is a deploy-time setting, its path is fixed, redirects and proxy settings are ignored, and the
+  reply is size-capped and checked strictly. It is the only file allowed to use a web client, written down on purpose in
+  `tests/test_fixed_destinations.py`.
 
 ## Security guardrails
 
@@ -42,6 +45,8 @@ weakness that is not claimed. The written design rules, each tied to a named tes
 | Only reviewed cryptography | `tests/test_cryptography_rules.py` |
 | Settings fixed at deploy time, nothing identifies a caller except a key | `tests/test_configuration_rules.py`, `tests/test_identity_rules.py` |
 | Secrets read only from mounted files under `/etc/secrets` | `tests/test_secret_files.py` |
+| The lookup: one fixed address, no redirects, strict reply, failures stop the worker | `tests/test_lookup.py`, `tests/test_worker.py` |
+| Strict job and result messages, contract limits | `tests/test_jobs.py`, `tests/test_reason_codes.py` |
 | No secret in any repo file | `tests/test_no_secrets_in_the_repo.py` |
 | Locked, hash-checked libraries, pinned base image and Actions | `tests/test_dependency_lock.py`, `tests/test_supply_chain_pins.py`, `tests/test_image_pins.py` |
 | Hardened, internal-only pods | `tests/test_pod_hardening.py`, `tests/test_internal_only.py`, `tests/test_k8s_manifests.py` |
@@ -74,8 +79,11 @@ top of the `.in` file (it needs Docker).
 
 ## Known limits
 
-- No Kafka, no knowledge-service lookup, no model: the service does not grade anything yet.
+- No model: the grade is a fixed fake answer. The similar examples are fetched and checked but not yet used.
 - No inbound keys: with no business routes there is nothing to protect with a key. The first inbound
   route, if one is ever added, must come with its own key check and permission tests.
 - TLS, encryption of stored data and Kafka login wait for the AWS step, the same as the other
-  services.
+  services. Until then the call to the knowledge service travels in plain text inside the cluster and its reply is not
+  signed.
+- The key for the knowledge service is a Secret made by hand (`knowledge-lookup-key`); the deploy script checks it exists
+  and never creates it.

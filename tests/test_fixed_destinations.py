@@ -25,23 +25,41 @@ OUTBOUND_MODULES = {
     "telnetlib", "xmlrpc", "poplib", "imaplib", "paramiko", "grpc",
 }
 
+# The one deliberate exception: the file that is allowed to import an outbound module, and which module. Every other
+# file stays banned. The lookup (app/lookup.py) asks the knowledge service for similar examples; its address is a
+# deploy-time setting and its path a fixed word (tests/test_lookup.py proves that, and that redirects are not followed).
+ALLOWED_OUTBOUND = {"lookup.py": {"httpx"}}
+
 # Calls whose first argument names a Kafka topic.
 TOPIC_CALLS = {"produce", "subscribe"}
 
+# Methods of a web client that take the address (or path) to call, and where that argument sits. In an allowed file
+# the address must be a fixed word (a text or a named constant), never something computed from a message.
+ADDRESS_CALLS = {"get": 0, "post": 0, "put": 0, "patch": 0, "delete": 0, "head": 0, "options": 0, "request": 1, "stream": 1, "send": 0}
+# In every OTHER file the rule applies too, but not to "get", "head" and "options": those names are also dictionary and
+# settings lookups all over normal code. The sending methods are checked everywhere, so a web client handed to some
+# other file cannot be pointed at a computed address either.
+ADDRESS_CALLS_EVERYWHERE = {name: place for name, place in ADDRESS_CALLS.items() if name not in ("get", "head", "options")}
 
 # In plain English: reads one program's text and returns plain sentences, one per problem, each with
 # its line number.
 def find_unfixed_destinations(source, name="<code>"):
     tree = ast.parse(source)
     problems = []
+    allowed = ALLOWED_OUTBOUND.get(name.rsplit("/", 1)[-1], set())
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.split(".")[0] in OUTBOUND_MODULES:
+                if alias.name.split(".")[0] in OUTBOUND_MODULES and alias.name.split(".")[0] not in allowed:
                     problems.append(f"{name}:{node.lineno}: imports '{alias.name}', which opens connections to other machines")
         elif isinstance(node, ast.ImportFrom):
-            if (node.module or "").split(".")[0] in OUTBOUND_MODULES:
+            if (node.module or "").split(".")[0] in OUTBOUND_MODULES and (node.module or "").split(".")[0] not in allowed:
                 problems.append(f"{name}:{node.lineno}: imports from '{node.module}', which opens connections to other machines")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in (ADDRESS_CALLS if allowed else ADDRESS_CALLS_EVERYWHERE) and len(node.args) > ADDRESS_CALLS[node.func.attr]:
+            address = node.args[ADDRESS_CALLS[node.func.attr]]
+            fixed = isinstance(address, ast.Name) or (isinstance(address, ast.Constant) and isinstance(address.value, str))
+            if not fixed:
+                problems.append(f"{name}:{node.lineno}: the address given to '{node.func.attr}' is computed, not a fixed word")
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in TOPIC_CALLS:
             if not node.args:
                 continue
@@ -74,7 +92,53 @@ def test_application_code_reaches_only_fixed_destinations():
 @pytest.mark.owasp("A05", 610)
 def test_the_check_covers_the_real_application_files():
     names = {path.name for path in app_files()}
-    assert {"main.py", "errors.py", "secret_files.py", "logsafe.py"} <= names
+    assert {"main.py", "errors.py", "secret_files.py", "logsafe.py", "lookup.py"} <= names
+
+
+# In plain English: the one allowance must still be needed (the file really imports that module) and must stay as narrow
+# as written: any other file importing it, or the allowed file importing another outbound module, is still caught.
+@pytest.mark.owasp("A05", 610)
+@pytest.mark.owasp("A01", 918, 441)
+def test_the_one_allowance_is_still_needed_and_stays_narrow():
+    assert ALLOWED_OUTBOUND == {"lookup.py": {"httpx"}}
+    text = (APP / "lookup.py").read_text(encoding="utf-8")
+    assert "import httpx" in text
+    assert find_unfixed_destinations("import httpx\n", "app/lookup.py") == []
+    assert find_unfixed_destinations("import httpx\n", "app/other.py") != []
+    assert find_unfixed_destinations("import requests\n", "app/lookup.py") != []
+    assert find_unfixed_destinations("import socket\n", "app/lookup.py") != []
+    assert find_unfixed_destinations("import httpx\n", "lookup.py.txt") != []
+
+
+@pytest.mark.owasp("A05", 610)
+@pytest.mark.owasp("A01", 918, 441)
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def f(client, m):\n    client.post(m.url)\n",
+        "def f(client, m):\n    client.post(f'/x/{m}')\n",
+        "def f(client, m):\n    client.post('/x/' + m)\n",
+        "def f(client, m):\n    client.stream('POST', m['path'])\n",
+        "def f(client, m):\n    client.request('GET', m.path)\n",
+        "def f(client, m):\n    client.get(m.url.lower())\n",
+    ],
+)
+def test_in_the_allowed_file_a_computed_address_is_still_caught(source):
+    assert find_unfixed_destinations(source, "app/lookup.py") != []
+
+
+@pytest.mark.owasp("A05", 610)
+@pytest.mark.parametrize(
+    "source",
+    [
+        "PATH = '/x'\ndef f(client):\n    client.post(PATH)\n",
+        "def f(client):\n    client.post('/examples/search')\n",
+        "PATH = '/x'\ndef f(client):\n    client.stream('POST', PATH, json={})\n",
+        "def f(d):\n    return d.get('key')\n",
+    ],
+)
+def test_in_the_allowed_file_a_fixed_address_passes(source):
+    assert find_unfixed_destinations(source, "app/lookup.py") == []
 
 
 # ---------------------------------------------------------------------------
@@ -120,3 +184,35 @@ def test_every_bad_program_is_caught():
 def test_every_good_program_passes():
     for label, source in GOOD_PROGRAMS.items():
         assert find_unfixed_destinations(source) == [], f"wrongly flagged: {label}: {find_unfixed_destinations(source)}"
+
+
+# In plain English: in a file that is NOT allowed to use a web client, a call that sends something to a computed address is
+# still caught, and ordinary dictionary and settings lookups are not mistaken for one.
+@pytest.mark.owasp("A05", 610)
+@pytest.mark.owasp("A01", 918, 441)
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def f(client, m):\n    client.post(m.url)\n",
+        "def f(client, m):\n    client.put(f'/x/{m}')\n",
+        "def f(client, m):\n    client.stream('POST', m['path'])\n",
+        "def f(client, m):\n    client.request('GET', m.path)\n",
+        "def f(client, m):\n    client.send(m.request)\n",
+    ],
+)
+def test_in_any_file_a_computed_address_for_a_sending_call_is_caught(source):
+    assert find_unfixed_destinations(source, "app/other.py") != []
+
+
+@pytest.mark.owasp("A05", 610)
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def f(d, m):\n    return d.get(m.key)\n",
+        "def f(environment):\n    return environment.get('KNOWLEDGE_URL')\n",
+        "def f(headers, m):\n    return headers.get(m.name)\n",
+        "PATH = '/x'\ndef f(client):\n    client.post(PATH)\n",
+    ],
+)
+def test_in_any_file_ordinary_lookups_and_fixed_addresses_pass(source):
+    assert find_unfixed_destinations(source, "app/other.py") == []
