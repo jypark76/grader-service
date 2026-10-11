@@ -1,0 +1,10 @@
+# In plain English: the service's NON-secret settings, kept in one place. There are no passwords here: the grader has
+# no secrets yet. To move to AWS, change KAFKA_BOOTSTRAP to the managed Kafka address and nothing else.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grader-service-config
+  namespace: grader
+data:
+  # Where Kafka lives inside the cluster. Only the worker uses this.
+  KAFKA_BOOTSTRAP: kafka.kafka.svc.cluster.local:9092

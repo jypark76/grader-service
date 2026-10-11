@@ -1,0 +1,58 @@
+# In plain English: tells the cluster to run the grading WORKER: the same image as the web side, but started with
+# the worker command, so it takes grading jobs off Kafka instead of answering web calls. If it fails (the grader is
+# unavailable, Kafka is down, a result could not be delivered) it stops with an error, Kubernetes restarts it, and the
+# message it was working on is tried again, because a message is only marked done after its answer is delivered.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grader-worker
+  namespace: grader
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grader-worker
+  template:
+    metadata:
+      labels:
+        app: grader-worker
+    spec:
+      # Never run as root. 1000 is the number of "appuser" inside our image. No Kubernetes API token: this pod never
+      # talks to the Kubernetes API, and a stolen token would be a free key to it.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        # A small, size-limited scratch folder, because the root filesystem is read-only.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      containers:
+        - name: grader-worker
+          # The same image as the web side; the version tag is added by each overlay.
+          image: grader-service
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          command: ["python", "-m", "app.worker"]
+          # Non-secret settings (KAFKA_BOOTSTRAP) come from the ConfigMap that each overlay supplies.
+          envFrom:
+            - configMapRef:
+                name: grader-service-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi

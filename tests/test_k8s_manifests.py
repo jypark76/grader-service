@@ -30,7 +30,7 @@ CLUSTER_WIDE = {"Namespace"}
 WORKLOADS = {"Deployment", "Job"}
 
 # The pods that must run locked down: a normal user, no extra privileges.
-LOCKED_DOWN = {"grader-service"}
+LOCKED_DOWN = {"grader-service", "grader-worker"}
 
 # Things the pods point at that are NOT in the rendered files on purpose. None yet: the grader has no secrets.
 MADE_OUTSIDE: set = set()
@@ -206,6 +206,8 @@ def test_real_overlay_breaks_no_rules(real_docs):
     kinds = {(doc["kind"], doc["metadata"]["name"]) for doc in real_docs}
     assert ("Deployment", "grader-service") in kinds
     assert ("Service", "grader-service") in kinds
+    assert ("Deployment", "grader-worker") in kinds
+    assert ("ConfigMap", "grader-service-config") in kinds
     assert ("Namespace", "grader") in kinds
     assert find_problems(real_docs) == []
 
@@ -376,3 +378,21 @@ def test_catches_a_password_written_in_the_files():
     containers_of(deployment_of(docs))[0]["env"] = [{"name": "SERVICE_PASSWORD", "value": "hunter2"}]
     problems = find_problems(docs)
     assert any("PASSWORD" in problem and "Secret" in problem for problem in problems)
+
+
+# In plain English: the worker is its own Deployment from the SAME image as the web side, started with the worker
+# command, and it is held to every pod rule (it is in LOCKED_DOWN). Its only settings come from the ConfigMap, and it
+# holds no secret, so no password or key can sit in its environment.
+def test_the_worker_runs_the_worker_code_from_the_same_image(real_docs):
+    worker = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "grader-worker")
+    service = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "grader-service")
+    container = containers_of(worker)[0]
+    assert container["image"] == containers_of(service)[0]["image"]
+    assert container["command"] == ["python", "-m", "app.worker"]
+    assert container["envFrom"] == [{"configMapRef": {"name": "grader-service-config"}}]
+    assert "env" not in container
+    assert references_of(worker) == {("ConfigMap", "grader-service-config")}
+
+
+def test_the_worker_is_held_to_the_pod_rules():
+    assert "grader-worker" in LOCKED_DOWN
