@@ -24,3 +24,7 @@ claim a rule that nothing checks. To add a rule, add the test first, then a row 
 | No file access | The application opens no file except the reviewed secret-file reader. | `tests/test_no_file_access.py::test_application_code_never_touches_the_file_system_or_redirects` |
 | No database | The grader is stateless: no database library, no SQL file. | `tests/test_no_database.py::test_the_application_imports_no_database_library` |
 | Fixed destinations | The application opens no outbound connection to an address a caller could choose. | `tests/test_fixed_destinations.py::test_application_code_reaches_only_fixed_destinations` |
+| Strict messages | Every job is read strictly against the contract; anything else is refused with a reason code. | `tests/test_jobs.py::test_a_bad_message_is_refused_with_its_code` |
+| Done only after delivery | A message is committed only after its answer or dead-letter copy is confirmed delivered. | `tests/test_worker.py::test_a_good_job_sends_its_answer_to_the_results_topic_before_the_commit` |
+| Never lose a job | If an answer cannot be delivered, nothing is committed and the worker stops. | `tests/test_worker.py::test_an_answer_that_is_not_delivered_is_not_committed` |
+| No student text in logs | The log carries only the outcome and the offset. | `tests/test_worker.py::test_the_log_carries_only_the_outcome_and_the_offset` |

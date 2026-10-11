@@ -1,0 +1,35 @@
+# In plain English: rules about text that every message shares, kept in one place so a new message cannot forget
+# them. These are the same rules the assessment service applies to the same texts, so a job it sends is never
+# refused here and a result sent from here is never refused there (see platform/contracts).
+
+
+# In plain English: refuses text that cannot be handled safely. A null character (the invisible character with
+# code zero) breaks many programs downstream, and text that cannot be written out as UTF-8 (for example half of a
+# character pair) cannot be sent on at all. The wording of each refusal is fixed and never quotes the text.
+def must_be_storable_text(value):
+    if "\x00" in value:
+        raise ValueError("Text must not contain null characters")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("Text must be valid Unicode") from None
+    return value
+
+
+# In plain English: for long free text that is kept exactly as written, such as a rubric or an essay. Checks the
+# text can be handled at all, is not blank, and is not longer than the limit. The text is returned unchanged,
+# spaces and all.
+def long_text(value, longest):
+    must_be_storable_text(value)
+    if not value.strip() or len(value) > longest:
+        raise ValueError(f"Must be 1 to {longest} characters and not blank")
+    return value
+
+
+# In plain English: first checks the text can be handled at all, then trims the spaces at either end and checks
+# the length.
+def trimmed(value, longest):
+    value = must_be_storable_text(value).strip()
+    if not 1 <= len(value) <= longest:
+        raise ValueError(f"Must be 1 to {longest} characters after trimming spaces")
+    return value
