@@ -1,63 +1,53 @@
-# In plain English: tells the cluster to run one copy of the knowledge service
-# and to keep it running. If it crashes, Kubernetes starts a new one.
-# This is the shared "base": it is the same in every environment. The settings
-# that differ (the database address, the image version) live in the overlays.
+# In plain English: tells the cluster to run one copy of the grader service and to keep it running. If it
+# crashes, Kubernetes starts a new one. This is the shared "base": it is the same in every environment. The
+# image version lives in the overlays.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: knowledge-service
-  namespace: knowledge
-  labels:
-    # This label lets the deploy script roll the service out AFTER the database
-    # changes are done. It is on this Deployment only.
-    deploy-phase: service
+  name: grader-service
+  namespace: grader
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: knowledge-service
+      app: grader-service
   template:
     metadata:
       labels:
-        app: knowledge-service
+        app: grader-service
     spec:
       # Safety rules for the pod: never run as the all-powerful root user.
       # 1000 is the number of "appuser" inside our image.
+      # No Kubernetes API token: this pod never talks to the Kubernetes API, and a stolen token would be a
+      # free key to it.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+        # Lets the user above read mounted Secret files (none yet; the first one is added with the Kafka reader).
+        fsGroup: 1000
+        # The container runtime's default filter blocks dozens of rarely used system calls.
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        # A small, size-limited scratch folder, because the root filesystem is read-only.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
       containers:
-        - name: knowledge-service
-          # The image NAME only. The version tag is added by each overlay (see
-          # the "images" part of its kustomization.yaml), never "latest":
-          # Kubernetes tries to download "latest" images, and the local one only
-          # exists on this laptop. On AWS the overlay swaps in the ECR address.
-          image: knowledge-service
+        - name: grader-service
+          # The image NAME only. The version tag is added by each overlay (see the "images" part of its
+          # kustomization.yaml), never "latest": Kubernetes tries to download "latest" images, and the local
+          # one only exists on this laptop. On AWS the overlay swaps in the ECR address.
+          image: grader-service
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           # Use the local copy if there is one; do not try to download.
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
-          # Load the non-secret settings (DB_HOST and friends) from the
-          # ConfigMap, which each overlay supplies under this same name.
-          envFrom:
-            - configMapRef:
-                name: knowledge-service-config
-          env:
-            # The password comes from the Secret you created, not from any file.
-            - name: DB_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: knowledge-db
-                  key: app-password
-            # The shared service key callers must present. Like the password it comes from a
-            # Secret created by hand, never from a file. It may list several keys, separated by
-            # commas, so a key can be replaced without downtime.
-            - name: SERVICE_KEYS
-              valueFrom:
-                secretKeyRef:
-                  name: knowledge-service-key
-                  key: keys
           # "Are you alive?" If this keeps failing, Kubernetes restarts the pod.
           livenessProbe:
             httpGet:
@@ -65,24 +55,23 @@ spec:
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
-          # "Are you ready for work?" Traffic is only sent once this passes,
-          # which also means the database login worked.
+          # "Are you ready for work?" Traffic is only sent once this passes.
           readinessProbe:
             httpGet:
               path: /ready
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 5
-          # Extra lockdown: no privilege tricks, and every special Linux power
-          # taken away.
+          # Extra lockdown: no privilege tricks, and every special Linux power taken away.
           securityContext:
             allowPrivilegeEscalation: false
+            # Nothing in the image can be changed while it runs. Anything that must be written goes in /tmp.
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-          # The embedding model lives in memory, so allow room for it.
           resources:
             requests:
-              cpu: 100m
-              memory: 512Mi
+              cpu: 50m
+              memory: 128Mi
             limits:
-              memory: 1Gi
+              memory: 256Mi
