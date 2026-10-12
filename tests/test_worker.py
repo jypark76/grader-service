@@ -13,7 +13,7 @@ import pytest
 
 from app import worker
 from app.jobs import read_job
-from app.lookup import LookupUnavailable
+from app.lookup import LookupRefused, LookupUnavailable
 from app.provider import FakeProvider, Grade, ProviderRefused, ProviderUnavailable
 from app.worker import DEAD_LETTER_TOPIC, RESULT_TOPIC, TOPIC
 
@@ -395,4 +395,41 @@ def test_a_missing_lookup_key_stops_the_worker_without_a_commit():
     fake = FakeConsumer([FakeMessage(*keyed(good_value()), 3)], log)
     with pytest.raises(RuntimeError):
         run(fake, FakeProducer(log), Provider(), should_stop=lambda: False, lookup=Lookup(error=RuntimeError("Missing required setting: KNOWLEDGE_KEY")))
+    assert log == [] and fake.closed
+
+
+# ---------- A job the knowledge service refuses for good ----------
+
+@pytest.mark.owasp("A10", 252, 754)
+def test_a_job_the_knowledge_service_refuses_for_good_is_dead_lettered_and_the_grader_is_never_asked():
+    provider = Provider()
+    assert handle_message(*keyed(good_value()), provider, Lookup(error=LookupRefused("refused"))) == ("dead_letter", "lookup_refused")
+    assert provider.seen == []
+
+
+@pytest.mark.owasp("A10", 252, 754)
+def test_a_refused_job_is_copied_to_the_dead_letter_topic_then_committed_so_it_cannot_block_its_lane():
+    data = good_value()
+    log = []
+    fake = FakeConsumer([FakeMessage(*keyed(data), 4), FakeMessage(*keyed(good_value()), 5)], log)
+    outcomes = iter([LookupRefused("refused"), None])
+
+    def lookup(job):
+        error = next(outcomes)
+        if error:
+            raise error
+        return []
+
+    run(fake, FakeProducer(log), Provider(), should_stop=lambda: not fake.messages, lookup=lookup)
+    kinds = [(entry[0], entry[1]) if entry[0] == "produce" else entry for entry in log]
+    assert kinds == [("produce", DEAD_LETTER_TOPIC), ("flush",), ("commit", 4), ("produce", RESULT_TOPIC), ("flush",), ("commit", 5)]
+    assert dict(log[0][4])["error"] == b"lookup_refused"
+
+
+@pytest.mark.owasp("A10", 252, 394)
+def test_a_wrong_key_still_stops_the_worker_it_is_not_dead_lettered():
+    log = []
+    fake = FakeConsumer([FakeMessage(*keyed(good_value()), 3)], log)
+    with pytest.raises(LookupUnavailable):
+        run(fake, FakeProducer(log), Provider(), should_stop=lambda: False, lookup=Lookup(error=LookupUnavailable("the lookup answered with status 401")))
     assert log == [] and fake.closed

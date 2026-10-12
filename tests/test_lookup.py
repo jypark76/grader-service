@@ -20,7 +20,7 @@ import pytest
 
 from app import lookup
 from app.jobs import read_job
-from app.lookup import EXAMPLE_COUNT, MAX_REPLY_BYTES, SEARCH_PATH, KnowledgeLookup, LookupUnavailable, checked_base_url, make_client
+from app.lookup import EXAMPLE_COUNT, MAX_REPLY_BYTES, REFUSED_STATUSES, SEARCH_PATH, KnowledgeLookup, LookupRefused, LookupUnavailable, checked_base_url, make_client
 
 KEY = "k" * 64
 BASE = "http://knowledge-service.knowledge.svc.cluster.local:8000"
@@ -186,13 +186,37 @@ def test_a_reply_exactly_at_the_cap_is_still_read():
 # ---------- Every kind of trouble ends the same way ----------
 
 @pytest.mark.owasp("A10", 252, 391, 396, 754)
-@pytest.mark.parametrize("status", [301, 302, 307, 308, 400, 401, 403, 404, 405, 408, 413, 422, 429, 500, 502, 503, 504])
-def test_any_answer_but_a_good_one_is_trouble_and_only_the_status_is_kept(status):
+@pytest.mark.parametrize("status", [301, 302, 307, 308, 401, 403, 404, 405, 408, 409, 429, 500, 502, 503, 504])
+def test_any_other_answer_than_a_good_one_is_trouble_and_only_the_status_is_kept(status):
     ask, _ = lookup_with(lambda request: httpx.Response(status, content=b"SECRET-BODY-MARKER", headers={"location": "http://evil.example/"}))
     with pytest.raises(LookupUnavailable) as problem:
         ask(good_job())
     assert str(problem.value) == f"the lookup answered with status {status}"
     assert "SECRET-BODY-MARKER" not in str(problem.value)
+
+
+# A refusal that will never change for THIS job must not loop for ever: 400, 413 and 422 are told apart from trouble. A wrong key
+# (401, 403), a wrong address (404, 405) or too many requests (429) are setup or temporary problems, which stop the worker instead.
+@pytest.mark.owasp("A10", 252, 754)
+@pytest.mark.parametrize("status", sorted(REFUSED_STATUSES))
+def test_a_refusal_that_will_never_change_for_this_job_is_told_apart_and_only_the_status_is_kept(status):
+    ask, seen = lookup_with(lambda request: httpx.Response(status, content=b"SECRET-BODY-MARKER"))
+    with pytest.raises(LookupRefused) as problem:
+        ask(good_job())
+    assert str(problem.value) == f"the lookup refused this job (status {status})"
+    assert "SECRET-BODY-MARKER" not in str(problem.value)
+    assert len(seen) == 1  # asked once, not retried
+
+
+def test_the_refused_statuses_are_exactly_the_agreed_ones():
+    assert REFUSED_STATUSES == {400, 413, 422}
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 405, 429, 500, 503])
+def test_a_wrong_key_or_address_or_a_server_problem_is_never_mistaken_for_a_refusal(status):
+    ask, _ = lookup_with(lambda request: httpx.Response(status))
+    with pytest.raises(LookupUnavailable):
+        ask(good_job())
 
 
 @pytest.mark.owasp("A10", 252, 391, 396, 754)
@@ -340,7 +364,7 @@ def test_the_real_client_follows_no_redirects_ignores_proxy_settings_and_has_tim
     client = make_client({"KNOWLEDGE_URL": BASE})
     assert client.follow_redirects is False and client.trust_env is False
     assert client.timeout.connect == lookup.CONNECT_TIMEOUT_SECONDS == 5.0
-    assert client.timeout.read == client.timeout.write == client.timeout.pool == lookup.TOTAL_TIMEOUT_SECONDS == 30.0
+    assert client.timeout.read == client.timeout.write == client.timeout.pool == lookup.READ_TIMEOUT_SECONDS == 10.0
     assert str(client.base_url).rstrip("/") == BASE
 
 
@@ -351,3 +375,76 @@ def test_the_code_builds_its_client_only_with_redirects_and_proxies_switched_off
     assert len(clients) == 1
     options = {keyword.arg: ast.literal_eval(keyword.value) for keyword in clients[0].keywords if isinstance(keyword.value, ast.Constant)}
     assert options["follow_redirects"] is False and options["trust_env"] is False
+
+
+# ---------- One overall deadline ----------
+
+class Clock:
+    """A clock the test controls: it only moves when told to."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class Trickle(httpx.SyncByteStream):
+    """A reply that arrives in small pieces, each one taking `step` seconds on the pretend clock."""
+
+    def __init__(self, clock, pieces, step):
+        self.clock, self.pieces, self.step = clock, pieces, step
+
+    def __iter__(self):
+        for piece in self.pieces:
+            self.clock.now += self.step
+            yield piece
+
+
+def lookup_with_clock(clock, stream):
+    client = httpx.Client(base_url=BASE, transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=stream)), follow_redirects=False, trust_env=False)
+    return KnowledgeLookup(client, clock=clock)
+
+
+@pytest.mark.owasp("A06", 799)
+@pytest.mark.owasp("A10", 396, 754)
+def test_a_reply_that_trickles_in_slowly_is_stopped_at_the_overall_deadline():
+    # Every single piece arrives well inside the per-step limit (10 s), yet the reply as a whole would take far longer
+    # than the deadline. Without an overall deadline this reply would be read to the end, one slow piece at a time.
+    clock = Clock()
+    pieces = [b"[" + b" " * 10] + [b" " * 10] * 50 + [b"]"]
+    ask = lookup_with_clock(clock, Trickle(clock, pieces, step=lookup.READ_TIMEOUT_SECONDS - 1))
+    with pytest.raises(LookupUnavailable, match="too long"):
+        ask(good_job())
+    assert clock.now - 1000.0 <= lookup.TOTAL_DEADLINE_SECONDS + lookup.READ_TIMEOUT_SECONDS  # stopped near the deadline, not at the end
+
+
+def test_a_reply_that_finishes_inside_the_deadline_is_accepted():
+    clock = Clock()
+    ask = lookup_with_clock(clock, Trickle(clock, [b"[", b"]"], step=lookup.TOTAL_DEADLINE_SECONDS / 4))
+    assert ask(good_job()) == []
+
+
+def test_a_reply_exactly_at_the_deadline_is_still_accepted():
+    clock = Clock()
+    ask = lookup_with_clock(clock, Trickle(clock, [b"[", b"]"], step=lookup.TOTAL_DEADLINE_SECONDS / 2))
+    assert ask(good_job()) == []
+
+
+@pytest.mark.owasp("A06", 799)
+def test_waiting_a_long_time_for_the_first_byte_counts_against_the_deadline_too():
+    clock = Clock()
+
+    def slow_start(request):
+        clock.now += lookup.TOTAL_DEADLINE_SECONDS + 1
+        return httpx.Response(200, content=b"[]")
+
+    client = httpx.Client(base_url=BASE, transport=httpx.MockTransport(slow_start), follow_redirects=False, trust_env=False)
+    with pytest.raises(LookupUnavailable, match="too long"):
+        KnowledgeLookup(client, clock=clock)(good_job())
+
+
+def test_the_deadline_and_the_step_limit_are_the_agreed_numbers_and_far_below_the_poll_interval():
+    assert lookup.TOTAL_DEADLINE_SECONDS == 30.0 and lookup.READ_TIMEOUT_SECONDS == 10.0
+    poll_interval_seconds = 600  # app/worker.py: max.poll.interval.ms is 600,000
+    assert lookup.TOTAL_DEADLINE_SECONDS + lookup.READ_TIMEOUT_SECONDS + lookup.CONNECT_TIMEOUT_SECONDS < poll_interval_seconds / 10

@@ -6,7 +6,7 @@
 # never lose one. Dealt with means one of:
 #   graded       a good job was graded and the answer was delivered to "grading-results" (the delivery is confirmed).
 #   dead_letter  a message that can never succeed (not JSON, unknown version, a broken rule, a key that is not the
-#                submission ID, or a job the grader refuses). It is copied to "grading-jobs.dead-letter" with the
+#                submission ID, a job the grader refuses, or a job the knowledge service refuses for good). It is copied to "grading-jobs.dead-letter" with the
 #                reason in a header, and that copy is confirmed delivered, so it cannot block its lane and a person
 #                can look at it.
 # Temporary trouble (the grader unavailable, Kafka down) is NOT dealt with: nothing is committed, the worker stops
@@ -19,7 +19,7 @@ import os
 import signal
 
 from app.jobs import build_result, read_job
-from app.lookup import KnowledgeLookup, make_client
+from app.lookup import KnowledgeLookup, LookupRefused, make_client
 from app.provider import FakeProvider, ProviderRefused
 
 TOPIC = "grading-jobs"
@@ -38,7 +38,12 @@ def handle_message(key, value, provider, lookup):
     kind, found = read_job(key, value)
     if kind == "dead_letter":
         return "dead_letter", found
-    examples = lookup(found)  # raises LookupUnavailable on trouble, which must reach the caller: nothing is committed
+    try:
+        examples = lookup(found)  # raises LookupUnavailable on trouble, which must reach the caller: nothing is committed
+    except LookupRefused:
+        # The knowledge service refuses this job for good (a bad request, too large, text it will not take). Trying
+        # again can never help, so the job is dead-lettered and cannot block the jobs behind it.
+        return "dead_letter", "lookup_refused"
     try:
         grade = provider.grade(found, examples)
     except ProviderRefused:
