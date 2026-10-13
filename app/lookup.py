@@ -19,7 +19,7 @@ import time
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from app.jobs import _read_json, _normal_uuid
+from app.jobs import read_json, normal_uuid
 from app.secret_files import read_secret
 from app.text_rules import long_text
 
@@ -72,7 +72,7 @@ class SimilarExample(BaseModel):
     @field_validator("example_id", "assignment_id", mode="before")
     @classmethod
     def ids_are_written_normally(cls, value):
-        return _normal_uuid(value)
+        return normal_uuid(value)
 
     @field_validator("student_work")
     @classmethod
@@ -171,7 +171,7 @@ class KnowledgeLookup:
         except httpx.HTTPError:
             raise LookupUnavailable("the lookup could not be reached") from None
         try:
-            data = _read_json(raw)
+            data = read_json(raw)
             if not isinstance(data, list) or len(data) > EXAMPLE_COUNT:
                 raise ValueError("not a short list")
             return [SimilarExample.model_validate(item) for item in data]

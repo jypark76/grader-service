@@ -29,7 +29,7 @@ REASONING_MAX = 10_000
 NORMAL_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
-def _normal_uuid(value):
+def normal_uuid(value):
     if not isinstance(value, str) or not NORMAL_UUID.fullmatch(value):
         raise ValueError("Must be a UUID written with hyphens")
     return value
@@ -51,7 +51,7 @@ class GradingJob(BaseModel):
     @field_validator("submission_id", "assignment_id", mode="before")
     @classmethod
     def ids_are_written_normally(cls, value):
-        return _normal_uuid(value)
+        return normal_uuid(value)
 
     @field_validator("rubric")
     @classmethod
@@ -106,7 +106,7 @@ def _no_special_numbers(token):
     raise ValueError("NaN and Infinity are not JSON")
 
 
-def _read_json(value):
+def read_json(value):
     return json.loads(value.decode("utf-8"), object_pairs_hook=_no_repeated_fields, parse_constant=_no_special_numbers)
 
 
@@ -115,7 +115,7 @@ def _read_json(value):
 # invalid_json, unknown_schema_version, invalid_field and key_mismatch. The reason never contains the student's text.
 def read_job(key, value):
     try:
-        data = _read_json(value)
+        data = read_json(value)
     except (AttributeError, UnicodeDecodeError, ValueError, RecursionError):
         return "dead_letter", "invalid_json"
     if not isinstance(data, dict):
