@@ -7,6 +7,7 @@
 #     decision made in a pull request that someone reads;
 #   - every long run of letters, digits, dashes and underscores (20 or more) must read like a name, be a digest or a commit pin, or
 #     be written out in tests/allowed_strings.py with its reason; a real key is random and reads like none of those;
+#   - a quoted value next to a word such as password, secret, token or api_key must read like a joined name, never like a password;
 #   - every "://" outside the tests folder must be followed by a plain host name, never by a name and password;
 #   - (the kinds and settings a Kubernetes file may use are checked in tests/test_allowed_manifests.py; a Secret is not allowed there).
 # Everything is read from the file text, comments included.
@@ -53,6 +54,17 @@ def test_no_long_string_in_the_repo_looks_like_a_key():
     for relative, text in allowed_text.readable_text_files():
         for line, token in allowed_text.unexplained_tokens(relative, text, ALLOWED_STRINGS):
             problems.append(f"{relative}:{line}: a {len(token)}-character string that does not read like a name")
+    assert problems == []
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+@pytest.mark.owasp("A07", 259, 798)
+@pytest.mark.owasp("A02", 260)
+def test_no_quoted_value_next_to_a_secret_word_looks_like_a_password():
+    problems = []
+    for relative, text in allowed_text.readable_text_files():
+        for line, value in allowed_text.unexplained_secret_values(relative, text, ALLOWED_STRINGS):
+            problems.append(f"{relative}:{line}: a {len(value)}-character value after a secret-sounding name")
     assert problems == []
 
 
@@ -110,6 +122,13 @@ PLANTED = {
     "a key made of lowercase letters and digits": made("x7k2q9m4v8", "b3n6c1z5l0", "p9o8i7u6y5"),
     "a random identifier used as a key": made("3f2b8c1e", "-9d4a-4b7e-", "8a1c-6e5f0d2b9a73"),
     "a long run of digits": made("12345678901234", "567890123456"),
+    "the AWS documentation example secret key": made("wJalrXUtnFEMI/", "K7MDENG/bPxRfiCY", "EXAMPLEKEY"),
+    "a random base64 key with a slash and a plus": made("Zk3q9XvL2mNz8R", "tYb5WcHd7J4qF/", "x+Pa0Sg1"),
+    "a random key of mixed-case letters only": made("kQzXvBnMwLpRtY", "hGjFdSaPoIuYtR", "eWqAzX"),
+    "a base64 key broken up by plus signs": made("Zk3q9XvL2mNz8Rt", "+", "Yb5WcHd7J4qFx9P", "+", "a0Sg1Lk7Qw3Er5T"),
+    "a key broken up by equals signs": made("Zk3q9XvL2mNz8Rt", "=", "Yb5WcHd7J4qFx9P", "=", "a0Sg1Lk7Qw3Er5T"),
+    "a key broken into short pieces": made("Zk3q9X", "-vL2mN", "z8-RtY", "b5-cHd", "7J4-qF", "x9Pa0S"),
+    "a base64 key ending in padding": made("Zm9vYmFyQm9iU2Vj", "cmV0UGFzc3dv", "cmQxMjM0NTY3ODk=="),
 }
 
 
@@ -120,6 +139,50 @@ PLANTED = {
 @pytest.mark.parametrize("label", sorted(PLANTED))
 def test_every_kind_of_planted_secret_is_refused(label):
     assert allowed_text.unexplained_tokens("app/x.py", f"value = {PLANTED[label]}\n"), label
+
+
+SECRET_LINES = {
+    "a password written into code": made("password = \"", "hunter2", "pw\""),
+    "an api key in a settings file": made("api_key: \"", "Zq8vK3", "mTx\""),
+    "a dictionary-word password": made("password = '", "change", "me'"),
+    "a token with letters and digits": made("auth_token = '", "a1b2c3", "d4e5f6'"),
+    "a secret in single quotes": made("SECRET = '", "Tr0ub4", "dor3x'"),
+    "a password keyword with a colon and a space": made("passwd :  \"", "correct", "horse\""),
+}
+HARMLESS_SECRET_LINES = [
+    'KEY_SETTING = "KNOWLEDGE_KEY"',
+    'secret_name = "knowledge-lookup-key"',
+    'password = os.environ.get("DB_PASSWORD")',
+    "secretKeyRef: {name: service-keys}",
+    'password = "${PASSWORD}"',
+    'token = "<the key>"',
+    'password = "$PASSWORD"',
+    'password = ""',
+    'short = "abc"',
+    "# the password is created by hand",
+]
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+@pytest.mark.owasp("A07", 259, 798)
+@pytest.mark.owasp("A02", 260)
+@pytest.mark.parametrize("label", sorted(SECRET_LINES))
+def test_a_password_written_next_to_its_name_is_refused(label):
+    assert allowed_text.unexplained_secret_values("app/x.py", SECRET_LINES[label] + "\n"), label
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+@pytest.mark.parametrize("line", HARMLESS_SECRET_LINES)
+def test_a_line_about_secrets_that_holds_no_password_is_not_refused(line):
+    assert allowed_text.unexplained_secret_values("app/x.py", line + "\n") == []
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+def test_a_listed_made_up_value_is_not_refused_next_to_a_secret_word():
+    line = SECRET_LINES["a password written into code"] + "\n"
+    value = "hunter2pw"
+    assert allowed_text.unexplained_secret_values("tests/x.py", line)
+    assert allowed_text.unexplained_secret_values("tests/x.py", line, {value: "made up"}) == []
 
 
 @pytest.mark.owasp("A01", 615)

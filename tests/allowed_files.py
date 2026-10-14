@@ -51,6 +51,7 @@ ALLOWED_FILES = (
     'tests/allowed_strings.py',
     'tests/allowed_table.py',
     'tests/allowed_text.py',
+    'tests/allowed_workflow_steps.py',
     'tests/allowed_yaml.py',
     'tests/conftest.py',
     'tests/owasp_report.py',

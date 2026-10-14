@@ -1,3 +1,7 @@
 # In plain English: keep shell scripts with Unix line endings even on
 # Windows, because the Windows style breaks them when they run.
 *.sh text eol=lf
+
+# The pre-push hook is a shell script too, and the check it starts is run by git on every push.
+hooks/pre-push text eol=lf
+hooks/*.py text eol=lf

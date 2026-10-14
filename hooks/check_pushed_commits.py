@@ -6,6 +6,7 @@
 # It reads every commit that is about to be pushed and applies the same allowed lists as tests/test_no_secrets_in_the_repo.py:
 #   - a file added by a pushed commit must be on tests/allowed_files.py;
 #   - every long string on an added line must read like a name, be a digest or a commit pin, or be on tests/allowed_strings.py;
+#   - an added quoted value next to a word such as password, secret, token or api_key must read like a joined name;
 #   - an added web address must have a plain host name, never a name and password in front of it (outside the tests folder).
 # It uses only what Python ships with, so it needs nothing installed. Install it once with:   git config core.hooksPath hooks
 import re
@@ -24,12 +25,17 @@ NOTHING = "0" * 40
 
 
 # In plain English: the lines a patch adds, as (file, text), and the files it adds, from the text of `git log -p` or `git diff`.
+# Inside a hunk every line starts with a space, + or -, so a added line that itself starts with "++ " (it shows as "+++ ") is still an
+# added line and not a file header. A file header can only appear before the first hunk of a file.
 def added_in(patch_text):
     lines, files, current = [], [], None
-    new_file = False
+    new_file = in_hunk = False
     for raw in patch_text.splitlines():
         if raw.startswith("diff --git "):
-            current, new_file = None, False
+            current, new_file, in_hunk = None, False, False
+        elif in_hunk:
+            if raw.startswith("+") and current is not None:
+                lines.append((current, raw[1:]))
         elif raw.startswith("new file mode"):
             new_file = True
         elif raw.startswith("+++ "):
@@ -37,8 +43,8 @@ def added_in(patch_text):
             current = name[2:] if name.startswith("b/") else name
             if current and new_file:
                 files.append(current)
-        elif raw.startswith("+") and current is not None:
-            lines.append((current, raw[1:]))
+        elif raw.startswith("@@"):
+            in_hunk = True
     return lines, files
 
 
@@ -51,6 +57,8 @@ def patch_problems(patch_text, allowed_files=None, allowed_strings=None):
     for name, text in lines:
         for _, token in allowed_text.unexplained_tokens(name, text + "\n", allowed_strings):
             problems.append(f"{name}: an added {len(token)}-character string that does not read like a name")
+        for _, value in allowed_text.unexplained_secret_values(name, text + "\n", allowed_strings):
+            problems.append(f"{name}: an added {len(value)}-character value after a secret-sounding name")
         if not name.startswith("tests/") and allowed_text.unexplained_addresses(text + "\n"):
             problems.append(f"{name}: an added address that carries a name or password")
     return problems

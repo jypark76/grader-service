@@ -3,10 +3,12 @@
 # works from what is ALLOWED:
 #   - every file in the repo must be on the list in tests/allowed_files.py, so a new file, whatever its name, is a decision made in a
 #     pull request that someone reads;
-#   - every long run of letters, digits, dashes and underscores (20 or more) must have the look of a NAME (words joined with
-#     underscores, dashes or capital letters, such as test_every_bad_program or readOnlyRootFilesystem), or be a digest after
-#     "sha256:", or a commit pin after "@" in a workflow, or be written out on the list in tests/allowed_strings.py. A real key is
-#     random letters and digits, which has none of those looks, so it is refused;
+#   - every long run of letters, digits, dashes, underscores, slashes, plus signs and equals signs (20 or more) must have the look of a
+#     NAME (words joined with underscores, dashes, slashes or capital letters, such as test_every_bad_program or
+#     readOnlyRootFilesystem), or be a digest after "sha256:", or a commit pin after "@" in a workflow, or be written out on the list
+#     in tests/allowed_strings.py. A real key is random letters and digits, which has none of those looks, so it is refused;
+#   - a quoted value of 8 or more characters next to a word such as password, secret, token or api_key must also read like a name
+#     (a short password is too short for the rule above, but it never reads like a name);
 #   - every "://" must be followed by a plain host name and a port, never by a name and password.
 import re
 from pathlib import Path
@@ -19,19 +21,25 @@ MAX_BYTES = 1_000_000
 # The only files whose lines may start with a bare 64-character digest (a checksum file).
 DIGEST_FILES = ("model/model.sha256",)
 
-LONG_TOKEN = re.compile(r"[A-Za-z0-9_-]{20,}")
+LONG_TOKEN = re.compile(r"[A-Za-z0-9_+/=-]{20,}")
+SPLIT = re.compile(r"[_/+=-]")
+# A quoted value of 8 or more characters (not a placeholder such as ${x}, {x}, <x> or $x) written after a secret-sounding name.
+SECRET_VALUE = re.compile(
+    r"(?i)\b(password|passwd|secret|api[_\-]?key|access[_\-]?key|auth[_\-]?token|token)\b[\"']?\s*[:=]\s*[\"']([^\"'\s{$<]{8,})[\"']"
+)
 HEX64 = re.compile(r"[0-9a-f]{64}")
 HEX40 = re.compile(r"[0-9a-f]{40}")
-# A word is a run of lowercase letters, a Capitalised word, or a run of capitals not followed by a lowercase letter (an acronym).
-# A part of a name is words, then up to four digits (sha256, api03, v2), or just up to four digits.
-WORD = r"(?:[A-Z]+(?![a-z])|[A-Z]?[a-z]+)"
-PART = re.compile(rf"(?:{WORD})+[0-9]{{0,4}}|[0-9]{{1,4}}")
+# A word is a run of two or more lowercase letters, a Capitalised word, or a run of capitals not followed by a lowercase letter (an
+# acronym). A part of a name is one or more words, then up to four digits (sha256, api03, v2), or just up to four digits, or a single
+# letter, or anything of four characters or fewer (k8s, s3, ec2). Random mixed-case letters break into one-letter pieces and fail.
+WORD = r"(?:[A-Z]+(?![a-z])|[A-Z]?[a-z]{2,})"
+PART = re.compile(rf"(?:{WORD})+[0-9]{{0,4}}|[0-9]{{1,4}}|[A-Za-z]|[A-Za-z0-9]{{2,4}}")
 AUTHORITY = re.compile(r"[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?=[/\s'\")\]>}`,;]|$)")
 
 
 # In plain English: true when a long token reads like a name: parts joined by underscores or dashes, each part made of words.
 def looks_like_a_name(token):
-    return all(PART.fullmatch(part) for part in re.split(r"[_-]", token) if part)
+    return all(PART.fullmatch(part) for part in SPLIT.split(token) if part)
 
 
 def repo_files():
@@ -87,3 +95,14 @@ def files_not_on_the_list(present, allowed):
 
 def listed_files_that_are_gone(present, allowed):
     return sorted(set(allowed) - set(present))
+
+
+# In plain English: every quoted value written after a secret-sounding name that does not read like a joined name (one plain word such as changeme does not), as (line number, value).
+def unexplained_secret_values(relative, text, allowed_strings=()):
+    found = []
+    for number, line in enumerate(text.splitlines(), 1):
+        for match in SECRET_VALUE.finditer(line):
+            value = match.group(2)
+            if not ((looks_like_a_name(value) and SPLIT.search(value)) or value in allowed_strings):
+                found.append((number, value))
+    return found

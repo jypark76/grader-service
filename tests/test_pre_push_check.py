@@ -70,6 +70,16 @@ def test_a_secret_that_a_later_commit_removes_still_refuses_the_push():
 
 
 @pytest.mark.owasp("A01", 540, 615, 538)
+@pytest.mark.owasp("A07", 259, 798)
+def test_a_password_next_to_its_name_on_an_added_line_refuses_the_push():
+    line = made("password = \"", "hunter2", "pw\"")
+    problems = hook.patch_problems(patch("app/x.py", [line], new=False))
+    assert problems and "after a secret-sounding name" in problems[0]
+    assert hook.patch_problems(patch("app/x.py", [made("api_key: \"", "Zq8vK3", "mTx\"")], new=False)) != []
+    assert hook.patch_problems(patch("app/x.py", ['password = os.environ.get("DB_PASSWORD")'], new=False)) == []
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
 def test_removing_a_secret_is_not_refused():
     removal = patch("app/x.py", ["value = None"], new=False, removed=[f"value = {SECRETS['a base64 password']}"])
     assert hook.patch_problems(removal) == []
@@ -165,3 +175,113 @@ def test_a_branch_that_is_deleted_sends_nothing(repository):
 @pytest.mark.owasp("A01", 540, 615, 538)
 def test_an_empty_input_is_fine():
     assert hook.main(io.StringIO("")) == 0
+
+
+# ---------- The hook itself, as git runs it ----------
+
+def real_git(folder, *arguments, check=True):
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *arguments], cwd=folder, capture_output=True, text=True, check=check)
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+def test_git_will_run_the_hook_because_it_is_marked_executable_in_the_repo():
+    # Git silently ignores a hook that is not marked executable, so a hook with mode 100644 protects nothing.
+    if shutil.which("git") is None or not (ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    listing = real_git(ROOT, "ls-files", "-s", "hooks/pre-push", "hooks/check_pushed_commits.py").stdout.splitlines()
+    assert sorted(line.split()[0] for line in listing) == ["100755", "100755"], listing
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+def test_the_hook_files_keep_unix_line_endings_on_every_computer():
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert "hooks/pre-push text eol=lf" in attributes and "hooks/*.py text eol=lf" in attributes
+
+
+@pytest.fixture
+def pushing_repository(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    remote = tmp_path / "remote.git"
+    work = tmp_path / "work"
+    real_git(tmp_path, "init", "-q", "--bare", "-b", "main", str(remote))
+    real_git(tmp_path, "init", "-q", "-b", "main", str(work))
+    (work / "hooks").mkdir()
+    (work / "tests").mkdir()
+    (work / "app").mkdir()
+    for name in ("pre-push", "check_pushed_commits.py"):
+        shutil.copy2(ROOT / "hooks" / name, work / "hooks" / name)
+    for name in ("allowed_text.py", "allowed_strings.py"):
+        shutil.copy2(ROOT / "tests" / name, work / "tests" / name)
+    (work / "tests" / "allowed_files.py").write_text(
+        'ALLOWED_FILES = ("app/x.py", "hooks/check_pushed_commits.py", "hooks/pre-push", "tests/allowed_files.py", "tests/allowed_strings.py", "tests/allowed_text.py")\n',
+        encoding="utf-8",
+    )
+    (work / "app" / "x.py").write_text("x = 1\n", encoding="utf-8")
+    real_git(work, "add", "-A")
+    real_git(work, "update-index", "--chmod=+x", "hooks/pre-push", "hooks/check_pushed_commits.py")  # as committed in the real repo
+    real_git(work, "commit", "-q", "-m", "first")
+    real_git(work, "remote", "add", "origin", str(remote))
+    real_git(work, "config", "core.hooksPath", "hooks")
+    return work, remote
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+@pytest.mark.owasp("A07", 259, 798)
+def test_a_real_git_push_runs_the_hook_and_is_refused_for_a_key_but_not_for_honest_work(pushing_repository):
+    work, remote = pushing_repository
+    honest = real_git(work, "push", "origin", "main", check=False)
+    assert honest.returncode == 0, honest.stderr
+    (work / "app" / "x.py").write_text(f"x = '{SECRETS['a 64-character hex key']}'\n", encoding="utf-8")
+    (work / "leaked.env").write_text("TOKEN=1\n", encoding="utf-8")
+    real_git(work, "add", "-A")
+    real_git(work, "commit", "-q", "-m", "oops")
+    leaked = real_git(work, "push", "origin", "main", check=False)
+    assert leaked.returncode != 0 and "Nothing was pushed" in leaked.stderr, leaked.stderr
+    assert "leaked.env" in leaked.stderr
+    on_remote = real_git(remote, "rev-parse", "main").stdout.strip()
+    assert on_remote != real_git(work, "rev-parse", "HEAD").stdout.strip()  # the remote never received the bad commit
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+def test_a_real_git_push_is_not_waved_through_when_the_hook_is_not_executable(pushing_repository):
+    # This proves why the executable mark matters: with it removed git runs nothing and the same bad push goes through.
+    work, remote = pushing_repository
+    (work / "leaked.env").write_text("TOKEN=1\n", encoding="utf-8")
+    real_git(work, "add", "-A")
+    real_git(work, "update-index", "--chmod=-x", "hooks/pre-push")
+    real_git(work, "commit", "-q", "-m", "oops")
+    (work / "hooks" / "pre-push").chmod(0o644)
+    assert real_git(work, "push", "origin", "main", check=False).returncode == 0
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+def test_a_line_that_starts_with_two_plus_signs_is_still_scanned():
+    key = SECRETS["a 64-character hex key"]
+    text = "diff --git a/app/x.py b/app/x.py\n--- a/app/x.py\n+++ b/app/x.py\n@@ -1 +1,2 @@\n-x\n+++ " + key + "\n"
+    assert hook.added_in(text) == ([("app/x.py", "++ " + key)], [])
+    assert hook.patch_problems(text) != []
+    # and a removed line that starts with two minus signs does not confuse the file header either
+    text = "diff --git a/app/x.py b/app/x.py\n--- a/app/x.py\n+++ b/app/x.py\n@@ -1,2 +1,2 @@\n--- old\n+++ " + key + "\n"
+    assert hook.patch_problems(text) != []
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+@pytest.mark.parametrize("name", ["python", "python3"])
+def test_the_hook_works_with_either_python_name(pushing_repository, tmp_path, monkeypatch, name):
+    import os
+
+    if os.name != "posix":
+        pytest.skip("this test shapes PATH the way a Unix computer has it")
+    work, remote = pushing_repository
+    bin_folder = tmp_path / "only-one-python"
+    bin_folder.mkdir()
+    (bin_folder / name).symlink_to(sys.executable)
+    git_folder = str(Path(shutil.which("git")).parent)
+    monkeypatch.setenv("PATH", f"{bin_folder}:{git_folder}:/bin")
+    honest = real_git(work, "push", "origin", "main", check=False)
+    assert honest.returncode == 0, honest.stderr
+    (work / "app" / "x.py").write_text(f"x = '{SECRETS['a 64-character hex key']}'\n", encoding="utf-8")
+    real_git(work, "commit", "-q", "-am", "oops")
+    leaked = real_git(work, "push", "origin", "main", check=False)
+    assert leaked.returncode != 0 and "Nothing was pushed" in leaked.stderr, leaked.stderr

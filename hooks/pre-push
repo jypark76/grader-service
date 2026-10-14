@@ -2,4 +2,9 @@
 # In plain English: git runs this just before a push. It hands the list of what is about to be pushed to hooks/check_pushed_commits.py,
 # which refuses the push if any pushed commit holds something that must not be in a public repo (a key, a password, a stray file).
 # Install it once, in this folder, with:   git config core.hooksPath hooks
-exec python "$(git rev-parse --show-toplevel)/hooks/check_pushed_commits.py"
+# (Git ignores a hook that is not marked executable; tests/test_pre_push_check.py checks the mark and does a real push.)
+root="$(git rev-parse --show-toplevel)"
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 "$root/hooks/check_pushed_commits.py"
+fi
+exec python "$root/hooks/check_pushed_commits.py"
