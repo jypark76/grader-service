@@ -372,18 +372,114 @@ def test_the_scanner_is_a_pinned_image_that_dependabot_keeps_current():
     assert ("docker", "/ci/scanner") in {(entry["package-ecosystem"], entry["directory"]) for entry in dependabot()["updates"]}
 
 
+# In plain English: the image scan may be told to ignore a flaw ONLY if that exact flaw is written here, with its reason and a date to look
+# at it again. Today the list is empty, so .grype.yaml must hold no exception at all. To waive a flaw, add it here and to .grype.yaml in the
+# same pull request; anything in .grype.yaml that is not here (or here but not in .grype.yaml) turns the test red.
+ALLOWED_SCAN_EXCEPTIONS = {
+    # "CVE-2026-12345": ("2026-10-12", "the flaw is in a Debian package we never run; fixed in the next base image", "2026-11-12"),
+}
+FLAW_ID = re.compile(r"CVE-\d{4}-\d{4,}|GHSA(-[a-z0-9]{4}){3}|DSA-[\w-]+")
+
+
+# In plain English: how the scan's list of ignored flaws differs from the allowed list, as plain sentences.
+def exception_problems(document, allowed):
+    rules = (document or {}).get("ignore") or []
+    problems = []
+    seen = []
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) != {"vulnerability"}:
+            problems.append(f"an exception must name exactly one flaw and nothing else (no package, no state): {rule!r}")
+            continue
+        flaw = str(rule["vulnerability"])
+        seen.append(flaw)
+        if flaw not in allowed:
+            problems.append(f"'{flaw}' is ignored but not in ALLOWED_SCAN_EXCEPTIONS")
+    problems += [f"'{flaw}' is allowed but not in .grype.yaml" for flaw in allowed if flaw not in seen]
+    problems += [f"'{flaw}' is ignored twice" for flaw in set(seen) if seen.count(flaw) > 1]
+    return problems
+
+
 @pytest.mark.owasp("A03", 1035, 1395)
-def test_every_exception_to_the_scan_names_one_flaw_and_gives_a_reason_and_a_date():
+def test_the_scan_ignores_only_the_flaws_on_the_allowed_list():
     need_image()
     config = ROOT / ".grype.yaml"
     assert config.exists(), ".grype.yaml is missing"
-    lines = config.read_text(encoding="utf-8").splitlines()
-    document = yaml.safe_load("\n".join(lines)) or {}
-    ignores = document.get("ignore") or []
-    for index, line in enumerate(lines):
-        if re.match(r"^\s*-\s*vulnerability:", line):
-            above = " ".join(lines[max(0, index - 3):index])
-            assert re.search(r"\d{4}-\d{2}-\d{2}", above) and "#" in above, f"exception without a dated reason: {line.strip()}"
-    for rule in ignores:
-        assert re.fullmatch(r"(CVE-\d{4}-\d{4,}|GHSA(-[a-z0-9]{4}){3}|DSA-[\w-]+)", str(rule.get("vulnerability", ""))), rule
-        assert set(rule) <= {"vulnerability", "package", "fix-state"}, rule
+    assert exception_problems(yaml.safe_load(config.read_text(encoding="utf-8")), ALLOWED_SCAN_EXCEPTIONS) == []
+
+
+# In plain English: what is wrong with the allowed list itself: each entry must be one exact flaw, with a real reason and two dates.
+def allowed_exception_problems(allowed):
+    problems = []
+    for flaw, entry in allowed.items():
+        if not (isinstance(entry, tuple) and len(entry) == 3):
+            problems.append(f"{flaw}: write (date, reason, review date)")
+            continue
+        date, reason, review = entry
+        if not FLAW_ID.fullmatch(flaw):
+            problems.append(f"'{flaw}' is not one exact flaw")
+        if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date)) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(review)) and review > date):
+            problems.append(f"{flaw}: the two dates must be written like 2026-10-12, the review after the first")
+        if len(str(reason)) < 20:
+            problems.append(f"{flaw}: give a real reason")
+    return problems
+
+
+@pytest.mark.owasp("A03", 1035, 1395)
+def test_every_allowed_exception_has_a_reason_and_two_dates():
+    assert allowed_exception_problems(ALLOWED_SCAN_EXCEPTIONS) == []
+
+
+@pytest.mark.owasp("A03", 1035, 1395)
+@pytest.mark.parametrize(
+    "allowed",
+    [
+        {"CVE-*": ("2026-10-12", "a reason that is long enough", "2026-11-12")},
+        {"all": ("2026-10-12", "a reason that is long enough", "2026-11-12")},
+        {"CVE-2026-12345": ("2026-10-12", "short", "2026-11-12")},
+        {"CVE-2026-12345": ("2026-10-12", "", "2026-11-12")},
+        {"CVE-2026-12345": ("yesterday", "a reason that is long enough", "2026-11-12")},
+        {"CVE-2026-12345": ("2026-10-12", "a reason that is long enough", "soon")},
+        {"CVE-2026-12345": ("2026-11-12", "a reason that is long enough", "2026-10-12")},
+        {"CVE-2026-12345": ("2026-10-12", "a reason that is long enough")},
+        {"CVE-2026-12345": "a reason that is long enough"},
+    ],
+)
+def test_a_badly_written_allowance_is_refused(allowed):
+    assert allowed_exception_problems(allowed) != []
+
+
+@pytest.mark.owasp("A03", 1035, 1395)
+def test_a_well_written_allowance_passes():
+    assert allowed_exception_problems(EXCEPTION_ALLOWED) == []
+    assert allowed_exception_problems({"GHSA-abcd-1234-wxyz": ("2026-10-12", "a reason that is long enough", "2026-11-12")}) == []
+
+
+EXCEPTION_ALLOWED = {"CVE-2026-12345": ("2026-10-12", "a package we never run", "2026-11-12")}
+BAD_EXCEPTIONS = {
+    "a flaw nobody allowed": {"ignore": [{"vulnerability": "CVE-2026-99999"}]},
+    "a flaw with a package": {"ignore": [{"vulnerability": "CVE-2026-12345", "package": {"name": "x"}}]},
+    "a flaw with a fix state": {"ignore": [{"vulnerability": "CVE-2026-12345", "fix-state": "unknown"}]},
+    "a whole package": {"ignore": [{"package": {"name": "openssl"}}]},
+    "everything": {"ignore": [{}]},
+    "a wildcard flaw": {"ignore": [{"vulnerability": "CVE-*"}]},
+    "something that is not a flaw": {"ignore": [{"vulnerability": "all"}]},
+    "an ignore that is not a list of rules": {"ignore": ["CVE-2026-12345"]},
+    "the same flaw twice": {"ignore": [{"vulnerability": "CVE-2026-12345"}, {"vulnerability": "CVE-2026-12345"}]},
+    "an allowed flaw that is missing": {"ignore": []},
+    "an allowed flaw that is missing, no ignore key": {},
+    "a second flaw added": {"ignore": [{"vulnerability": "CVE-2026-12345"}, {"vulnerability": "CVE-2026-11111"}]},
+}
+
+
+@pytest.mark.owasp("A03", 1035, 1395)
+@pytest.mark.parametrize("label", sorted(BAD_EXCEPTIONS))
+def test_every_other_scan_exception_is_refused(label):
+    assert exception_problems(BAD_EXCEPTIONS[label], EXCEPTION_ALLOWED) != [], label
+
+
+@pytest.mark.owasp("A03", 1035, 1395)
+def test_an_allowed_exception_and_an_empty_list_pass():
+    assert exception_problems({"ignore": [{"vulnerability": "CVE-2026-12345"}]}, EXCEPTION_ALLOWED) == []
+    assert exception_problems({"ignore": []}, {}) == []
+    assert exception_problems({}, {}) == []
+    assert exception_problems(None, {}) == []
