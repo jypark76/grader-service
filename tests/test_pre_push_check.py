@@ -285,3 +285,38 @@ def test_the_hook_works_with_either_python_name(pushing_repository, tmp_path, mo
     real_git(work, "commit", "-q", "-am", "oops")
     leaked = real_git(work, "push", "origin", "main", check=False)
     assert leaked.returncode != 0 and "Nothing was pushed" in leaked.stderr, leaked.stderr
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+def test_a_broken_python3_shortcut_is_skipped_and_the_working_python_is_used(pushing_repository, tmp_path, monkeypatch):
+    import os
+
+    if os.name != "posix":
+        pytest.skip("this test shapes PATH the way a Unix computer has it")
+    work, remote = pushing_repository
+    bin_folder = tmp_path / "broken-and-working"
+    bin_folder.mkdir()
+    broken = bin_folder / "python3"
+    broken.write_text("#!/bin/sh\necho 'Python was not found' >&2\nexit 49\n", encoding="utf-8")
+    broken.chmod(0o755)
+    (bin_folder / "python").symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", f"{bin_folder}:{Path(shutil.which('git')).parent}:/bin")
+    assert real_git(work, "push", "origin", "main", check=False).returncode == 0
+    (work / "app" / "x.py").write_text(f"x = '{SECRETS['a 64-character hex key']}'\n", encoding="utf-8")
+    real_git(work, "commit", "-q", "-am", "oops")
+    leaked = real_git(work, "push", "origin", "main", check=False)
+    assert leaked.returncode != 0 and "Nothing was pushed" in leaked.stderr
+
+
+@pytest.mark.owasp("A01", 540, 615, 538)
+def test_when_no_python_works_nothing_is_pushed(pushing_repository, tmp_path, monkeypatch):
+    import os
+
+    if os.name != "posix":
+        pytest.skip("this test shapes PATH the way a Unix computer has it")
+    work, remote = pushing_repository
+    empty = tmp_path / "no-python"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", f"{empty}:{Path(shutil.which('git')).parent}:/bin")
+    refused = real_git(work, "push", "origin", "main", check=False)
+    assert refused.returncode != 0 and "no working Python" in refused.stderr

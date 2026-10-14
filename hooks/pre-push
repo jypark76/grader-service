@@ -3,8 +3,13 @@
 # which refuses the push if any pushed commit holds something that must not be in a public repo (a key, a password, a stray file).
 # Install it once, in this folder, with:   git config core.hooksPath hooks
 # (Git ignores a hook that is not marked executable; tests/test_pre_push_check.py checks the mark and does a real push.)
+# It uses the first of python3 and python that really runs (on Windows, python3 can be a Store shortcut that does nothing). If neither
+# runs, nothing is pushed: a check that cannot run must never look like a check that passed.
 root="$(git rev-parse --show-toplevel)"
-if command -v python3 >/dev/null 2>&1; then
-  exec python3 "$root/hooks/check_pushed_commits.py"
-fi
-exec python "$root/hooks/check_pushed_commits.py"
+for candidate in python3 python; do
+  if "$candidate" -c "import sys" >/dev/null 2>&1; then
+    exec "$candidate" "$root/hooks/check_pushed_commits.py"
+  fi
+done
+echo "Nothing was pushed: no working Python was found to run hooks/check_pushed_commits.py (install Python, or ask for help)." >&2
+exit 1
