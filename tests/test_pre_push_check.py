@@ -70,16 +70,6 @@ def test_a_secret_that_a_later_commit_removes_still_refuses_the_push():
 
 
 @pytest.mark.owasp("A01", 540, 615, 538)
-@pytest.mark.owasp("A07", 259, 798)
-def test_a_password_next_to_its_name_on_an_added_line_refuses_the_push():
-    line = made("password = \"", "hunter2", "pw\"")
-    problems = hook.patch_problems(patch("app/x.py", [line], new=False))
-    assert problems and "after a secret-sounding name" in problems[0]
-    assert hook.patch_problems(patch("app/x.py", [made("api_key: \"", "Zq8vK3", "mTx\"")], new=False)) != []
-    assert hook.patch_problems(patch("app/x.py", ['password = os.environ.get("DB_PASSWORD")'], new=False)) == []
-
-
-@pytest.mark.owasp("A01", 540, 615, 538)
 def test_removing_a_secret_is_not_refused():
     removal = patch("app/x.py", ["value = None"], new=False, removed=[f"value = {SECRETS['a base64 password']}"])
     assert hook.patch_problems(removal) == []

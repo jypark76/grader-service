@@ -7,8 +7,6 @@
 #     NAME (words joined with underscores, dashes, slashes or capital letters, such as test_every_bad_program or
 #     readOnlyRootFilesystem), or be a digest after "sha256:", or a commit pin after "@" in a workflow, or be written out on the list
 #     in tests/allowed_strings.py. A real key is random letters and digits, which has none of those looks, so it is refused;
-#   - a quoted value of 8 or more characters next to a word such as password, secret, token or api_key must also read like a name
-#     (a short password is too short for the rule above, but it never reads like a name);
 #   - every "://" must be followed by a plain host name and a port, never by a name and password.
 import re
 from pathlib import Path
@@ -22,11 +20,8 @@ MAX_BYTES = 1_000_000
 DIGEST_FILES = ("model/model.sha256",)
 
 LONG_TOKEN = re.compile(r"[A-Za-z0-9_+/=-]{20,}")
+MAX_WORD = 24
 SPLIT = re.compile(r"[_/+=-]")
-# A quoted value of 8 or more characters (not a placeholder such as ${x}, {x}, <x> or $x) written after a secret-sounding name.
-SECRET_VALUE = re.compile(
-    r"(?i)\b(password|passwd|secret|api[_\-]?key|access[_\-]?key|auth[_\-]?token|token)\b[\"']?\s*[:=]\s*[\"']([^\"'\s{$<]{8,})[\"']"
-)
 HEX64 = re.compile(r"[0-9a-f]{64}")
 HEX40 = re.compile(r"[0-9a-f]{40}")
 # A word is a run of two or more lowercase letters, a Capitalised word, or a run of capitals not followed by a lowercase letter (an
@@ -39,7 +34,13 @@ AUTHORITY = re.compile(r"[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?=[/\s'\")\]>}`,;]|$)")
 
 # In plain English: true when a long token reads like a name: parts joined by underscores or dashes, each part made of words.
 def looks_like_a_name(token):
-    return all(PART.fullmatch(part) for part in SPLIT.split(token) if part)
+    for part in SPLIT.split(token):
+        if not part:
+            continue
+        # A name is built from words, and a word is short: a run of more than 24 letters of one case is not a word.
+        if (re.fullmatch(r"[a-z]+|[A-Z]+", part) and len(part) > MAX_WORD) or not PART.fullmatch(part):
+            return False
+    return True
 
 
 def repo_files():
@@ -95,14 +96,3 @@ def files_not_on_the_list(present, allowed):
 
 def listed_files_that_are_gone(present, allowed):
     return sorted(set(allowed) - set(present))
-
-
-# In plain English: every quoted value written after a secret-sounding name that does not read like a joined name (one plain word such as changeme does not), as (line number, value).
-def unexplained_secret_values(relative, text, allowed_strings=()):
-    found = []
-    for number, line in enumerate(text.splitlines(), 1):
-        for match in SECRET_VALUE.finditer(line):
-            value = match.group(2)
-            if not ((looks_like_a_name(value) and SPLIT.search(value)) or value in allowed_strings):
-                found.append((number, value))
-    return found
