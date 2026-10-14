@@ -33,10 +33,8 @@ APP = Path(__file__).resolve().parent.parent / "app"
 # The files whose outbound call has a pinned shape.
 LOOKUP_FILES = {"lookup.py"}
 KAFKA_FILES = {"worker.py"}
-STREAM_KEYWORDS = {"json", "headers"}
-PRODUCE_KEYWORDS = {"key", "value", "headers", "on_delivery"}
-FIXED_TOPICS = {"RESULT_TOPIC", "DEAD_LETTER_TOPIC"}
-SEND_HELPER = "_deliver"
+# The names that fix where the service reaches: each must be a text written once at the top of its file and never bound again.
+FIXED_CONSTANTS = {"lookup.py": ("SEARCH_PATH",), "worker.py": ("TOPIC", "RESULT_TOPIC", "DEAD_LETTER_TOPIC")}
 
 
 # In plain English: true if the name is bound exactly once in the whole file, and that one binding is a text written at the top
@@ -59,34 +57,19 @@ def lookup_problems(tree, name):
     # 1. The name httpx is never re-bound.
     if sum(1 for node in ast.walk(tree) if "httpx" in names_bound_by(node)) != 1:
         problems.append(f"{name}: the name httpx must be bound exactly once, by 'import httpx'")
-    # 2. The web client lives in self.web, which is set once from the constructor's parameter and used for one call.
-    pinned_calls = []
+    # 2. The web client lives in self.web, which is only ever used for the one stream call (never copied, passed on or read by itself).
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and ast.unparse(node) == "self.web":
             holder = parents.get(node)
             if isinstance(node.ctx, ast.Store):
                 continue
-            elif isinstance(holder, ast.Attribute) and holder.attr == "stream" and isinstance(parents.get(holder), ast.Call) and parents[holder].func is holder:
-                pinned_calls.append(parents[holder])
-            else:
+            if not (isinstance(holder, ast.Attribute) and holder.attr == "stream" and isinstance(parents.get(holder), ast.Call) and parents[holder].func is holder):
                 problems.append(f"{name}:{node.lineno}: self.web is used other than for the one pinned stream call")
-    for call in pinned_calls:
-        shape_ok = (
-            len(call.args) == 2
-            and isinstance(call.args[0], ast.Constant) and call.args[0].value == "POST"
-            and isinstance(call.args[1], ast.Name) and call.args[1].id == "SEARCH_PATH"
-            and all(keyword.arg in STREAM_KEYWORDS for keyword in call.keywords)
-        )
-        if not shape_ok:
-            problems.append(f"{name}:{call.lineno}: the web call is not exactly stream('POST', SEARCH_PATH, json=..., headers=...)")
     # 3. The constructor parameter "client" is read exactly once: to set self.web.
     reads = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "client" and isinstance(node.ctx, ast.Load)]
     if len(reads) > 1:
         problems.append(f"{name}: the client parameter is used more than once")
-    # 4. The address name is a text bound once at the top of the file.
-    if not is_a_text_constant_bound_once(tree, "SEARCH_PATH"):
-        problems.append(f"{name}: SEARCH_PATH must be a text written once at the top of the file and never bound again")
-    # 5. The one web client is built in make_client and handed straight back; no other client exists.
+    # 4. The one web client is built in make_client and handed straight back; no other client exists.
     clients = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "httpx.Client"]
     for call in clients:
         function = call
@@ -98,13 +81,12 @@ def lookup_problems(tree, name):
     return problems
 
 
-# In plain English: checks the worker's Kafka calls, and returns plain sentences, one per problem.
+# In plain English: checks what the exact call texts in tests/allowed_table.py cannot say about the worker's Kafka use: the topic the send
+# helper uses is its own unchanged parameter, and the names that hold the topics are texts written once and never bound again.
 def kafka_problems(tree, name):
     problems = []
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-    produces = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "produce"]
-    subscribes = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "subscribe"]
-    for call in produces:
+    for call in [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "produce"]:
         function = call
         while function in parents and not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             function = parents[function]
@@ -114,32 +96,14 @@ def kafka_problems(tree, name):
             for statement in function.body:
                 for part in ast.walk(statement):
                     rebound |= names_bound_by(part)
-        shape_ok = (
-            len(call.args) == 1 and isinstance(call.args[0], ast.Name) and call.args[0].id == "topic"
-            and topic_is_a_parameter and "topic" not in rebound
-            and all(keyword.arg in PRODUCE_KEYWORDS for keyword in call.keywords)
-        )
-        if not shape_ok:
-            problems.append(f"{name}:{call.lineno}: produce must be produce(topic, key=, value=, headers=, on_delivery=) with topic an unchanged parameter")
-    for call in subscribes:
-        topics = call.args[0] if call.args else None
-        shape_ok = (
-            len(call.args) == 1 and not call.keywords and isinstance(topics, ast.List) and len(topics.elts) == 1
-            and isinstance(topics.elts[0], ast.Name) and is_a_text_constant_bound_once(tree, topics.elts[0].id)
-        )
-        if not shape_ok:
-            problems.append(f"{name}:{call.lineno}: subscribe must be subscribe([NAME]) with NAME a text constant bound once")
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == SEND_HELPER:
-            fixed = (
-                len(node.args) >= 2 and not any(isinstance(argument, ast.Starred) for argument in node.args)
-                and isinstance(node.args[1], ast.Name) and node.args[1].id in FIXED_TOPICS
-                and is_a_text_constant_bound_once(tree, node.args[1].id)
-                and all(keyword.arg not in (None, "topic") for keyword in node.keywords)
-            )
-            if not fixed:
-                problems.append(f"{name}:{node.lineno}: {SEND_HELPER} must be called with one of {sorted(FIXED_TOPICS)} as its topic")
+        if not (topic_is_a_parameter and "topic" not in rebound):
+            problems.append(f"{name}:{call.lineno}: the topic given to produce must be an unchanged parameter of its function")
     return problems
+
+
+# In plain English: the names that fix where the file reaches must each be a text written once at the top and never bound again.
+def constant_problems(tree, name, constants):
+    return [f"{name}: {constant} must be a text written once at the top of the file and never bound again" for constant in constants if not is_a_text_constant_bound_once(tree, constant)]
 
 
 # In plain English: only the shapes of the pinned calls (the list of allowed names is tests/test_allowed_code.py).
@@ -151,6 +115,7 @@ def pinned_problems(source, name="<code>"):
         problems += lookup_problems(tree, name)
     if base in KAFKA_FILES:
         problems += kafka_problems(tree, name)
+    problems += constant_problems(tree, name, FIXED_CONSTANTS.get(base, ()))
     return problems
 
 
@@ -194,10 +159,10 @@ class KnowledgeLookup:
     def __init__(self, client):
         self.web = client
 
-    def __call__(self, job):
+    def __call__(self, job, body, key):
 @BODY@
 """
-GOOD_CALL = '        with self.web.stream("POST", SEARCH_PATH, json={}, headers={}) as reply:\n            return reply'
+GOOD_CALL = '        with self.web.stream("POST", SEARCH_PATH, json=body, headers={"Authorization": f"Bearer {key}"}) as reply:\n            return reply'
 WORKER = """\
 TOPIC = "grading-jobs"
 RESULT_TOPIC = "grading-results"
@@ -208,12 +173,12 @@ def _deliver(producer, topic, key, value, headers=None):
 @BODY@
 
 
-def run(consumer, producer):
+def run(consumer, producer, detail, message, reason):
     consumer.subscribe([TOPIC])
-    _deliver(producer, RESULT_TOPIC, 1, 2)
-    _deliver(producer, DEAD_LETTER_TOPIC, 1, 2, headers=[])
+    _deliver(producer, RESULT_TOPIC, detail[0], detail[1])
+    _deliver(producer, DEAD_LETTER_TOPIC, message.key(), message.value(), headers=[("error", reason.encode("utf-8"))])
 """
-GOOD_PRODUCE = "    producer.produce(topic, key=key, value=value, headers=headers, on_delivery=None)"
+GOOD_PRODUCE = "    refused = []\n    producer.produce(topic, key=key, value=value, headers=headers, on_delivery=lambda error, _message: refused.append(error) if error else None)"
 
 
 def lookup(body):
@@ -374,15 +339,15 @@ def test_the_one_allowance_stays_narrow():
 @pytest.mark.owasp("A01", 918, 441)
 def test_the_one_client_is_built_in_make_client_and_returned_directly():
     good = lookup(GOOD_CALL) + "\n\ndef make_client(environment):\n    return httpx.Client(base_url=environment)\n"
-    assert find_unfixed_destinations(good, "app/lookup.py") == []
+    assert pinned_problems(good, "app/lookup.py") == []
     kept = lookup(GOOD_CALL) + "\n\ndef make_client(environment):\n    c = httpx.Client(base_url=environment)\n    return c\n"
-    assert find_unfixed_destinations(kept, "app/lookup.py") != []  # built in make_client but not handed straight back
+    assert pinned_problems(kept, "app/lookup.py") != []  # built in make_client but not handed straight back
     elsewhere = lookup("        if job:\n            return httpx.Client()\n" + GOOD_CALL)
-    assert find_unfixed_destinations(elsewhere, "app/lookup.py") != []  # handed straight back, but not built in make_client
+    assert pinned_problems(elsewhere, "app/lookup.py") != []  # handed straight back, but not built in make_client
     two = good + "\n\ndef make_client2(environment):\n    return httpx.Client(base_url=environment)\n"
-    assert find_unfixed_destinations(two, "app/lookup.py") != []  # a second client anywhere
+    assert pinned_problems(two, "app/lookup.py") != []  # a second client anywhere
     many = lookup(GOOD_CALL) + "\n\ndef make_client(environment):\n    if environment:\n        return httpx.Client(base_url=environment)\n    return httpx.Client()\n"
-    assert find_unfixed_destinations(many, "app/lookup.py") != []  # two clients, both built in make_client and both returned directly
+    assert pinned_problems(many, "app/lookup.py") != []  # two clients, both built in make_client and both returned directly
 
 
 # ---------- Kafka ----------
@@ -606,7 +571,7 @@ def test_every_way_of_binding_the_address_name_is_caught(label, binding):
 @pytest.mark.owasp("A01", 918, 441)
 @pytest.mark.parametrize("label, parameter", SIGNATURE_FORMS, ids=[label for label, _ in SIGNATURE_FORMS])
 def test_a_parameter_named_like_the_address_is_caught(label, parameter):
-    source = lookup(GOOD_CALL).replace("def __call__(self, job):", f"def __call__(self, {parameter.replace('NAME', 'SEARCH_PATH')}):")
+    source = lookup(GOOD_CALL).replace("def __call__(self, job, body, key):", f"def __call__(self, body, key, {parameter.replace('NAME', 'SEARCH_PATH')}):")
     compile(source, label, "exec")
     assert pinned_problems(source, "app/lookup.py") != [], f"not caught: {label}"
 

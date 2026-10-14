@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import allowed_code
-from allowed_bad_programs import CORPORA
+from allowed_bad_programs import APPENDED, CORPORA
 from allowed_table import TABLE
 
 APP = Path(__file__).resolve().parent.parent / "app"
@@ -146,6 +146,23 @@ def test_every_bad_program_about_database_is_refused(label):
     assert_refused_everywhere('no database', label)
 
 
+# ---------- The check proves itself: a sneaked capability using only names the file already uses ----------
+
+APPENDED_CASES = [(filename, label) for filename, programs in APPENDED.items() for label in programs]
+
+
+@pytest.mark.owasp("A05", 610)
+@pytest.mark.owasp("A01", 441, 918)
+@pytest.mark.owasp("A07", 941)
+@pytest.mark.owasp("A02", 15, 526, 942)
+@pytest.mark.parametrize("filename, label", APPENDED_CASES)
+def test_every_sneaked_capability_is_refused(filename, label):
+    source = (APP / filename).read_text(encoding="utf-8") + "\n\n" + APPENDED[filename][label]
+    ast.parse(source)
+    extra, _ = allowed_code.compare(source, f"app/{filename}", TABLE)
+    assert extra, f"not refused in {filename}: {label}"
+
+
 # ---------- The check proves itself: one extra thing of every kind ----------
 
 BASE = """\
@@ -185,7 +202,7 @@ def test_a_program_that_uses_exactly_what_is_listed_is_clean():
 
 EXTRAS = {
     "an import": ("import os\n", "import os"),
-    "the pinned call made in another function": ("def more(v):\n    return json.loads(v)\n", "json.loads in more"),
+    "the pinned call made in another function": ("def more(v):\n    return json.loads(v)\n", "json.loads(v) in more"),
     "a from-import": ("from os import path\n", "from os import path"),
     "an import with a nickname": ("import json as j\n", "import json as j"),
     "a star import": ("from os import *\n", "from os import *"),
@@ -196,8 +213,8 @@ EXTRAS = {
     "a built-in name": ("def more(v):\n    return v is eval\n", "eval"),
     "a built-in called": ("def more(v):\n    return open(v)\n", "open"),
     "a keyword name": ("def more(v):\n    return json.loads(v, strict=False)\n", "strict"),
-    "a ** expansion": ("def more(v, k):\n    return json.loads(v, **k)\n", "**"),
-    "a * expansion": ("def more(v, k):\n    return json.loads(*k)\n", "*"),
+    "a ** expansion": ("def more(environment, k):\n    return environment.get(**k)\n", "**"),
+    "a * expansion": ("def more(environment, k):\n    return environment.get(*k)\n", "*"),
     "another error caught": ("def more(v):\n    try:\n        return json.loads(v)\n    except KeyError:\n        return 1\n", "KeyError"),
     "a bare except": ("def more(v):\n    try:\n        return json.loads(v)\n    except:\n        return 1\n", "BARE"),
     "a kind of code nobody may use": ("f = lambda: 1\n", "Lambda"),
@@ -271,11 +288,11 @@ def test_a_file_that_is_not_in_the_table_is_refused():
 def test_the_pinned_call_made_twice_in_its_own_function_is_refused():
     source = BASE.replace("        return json.loads(value)", "        json.loads(value)\n        return json.loads(value)")
     extra, _ = allowed_code.compare(source, "app/a.py", exact_table(BASE))
-    assert extra and "json.loads in go x2" in extra[0]
+    assert extra and "json.loads(value) in go x2" in extra[0]
 
 
 STALE = {
-    "a pinned call site": ("sites", "json.loads in elsewhere x1"),
+    "a pinned call site": ("sites", "json.loads(v) in elsewhere x1"),
     "an import": ("imports", "import os"),
     "a call": ("calls", "json.dumps"),
     "an attribute": ("values", "v.size"),

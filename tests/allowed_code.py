@@ -87,7 +87,8 @@ def facts_of(source, sensitive=()):
             callee = ast.unparse(node.func)
             facts["calls"].add(callee)
             if callee in sensitive:
-                counts[f"{callee} in {_function_name(node, parents)}"] = counts.get(f"{callee} in {_function_name(node, parents)}", 0) + 1
+                site = f"{ast.unparse(node)} in {_function_name(node, parents)}"  # the whole call, arguments included
+                counts[site] = counts.get(site, 0) + 1
             for keyword in node.keywords:
                 facts["keywords"].add(keyword.arg or "**")
                 if keyword.arg == "headers" and isinstance(keyword.value, ast.Dict):

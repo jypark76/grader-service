@@ -76,7 +76,7 @@ TABLE = {
         # The only functions that may be handed the whole environment (they read named settings from it and nothing else).
         "environment_receivers": ("consumer_settings", "make_client", "producer_settings"),
         # Calls that reach outside the program. Each may appear only at the sites listed in a file's entry, exactly that many times.
-        "sensitive_calls": ('open', 'self.web.stream', 'httpx.Client', 'producer.produce', 'consumer.subscribe'),
+        "sensitive_calls": ('open', 'self.web.stream', 'httpx.Client', 'producer.produce', 'consumer.subscribe', 'Consumer', 'Producer', '_deliver', 'make_client', 'KnowledgeLookup', 'read_secret', 'consumer_settings', 'producer_settings', 'environment.get', 'os.environ.get', 'json.loads', 're.compile', 're.sub', 'FastAPI', 'app.get', 'app.add_exception_handler', 'app.middleware'),
         # The only files that may write out a set of headers by hand.
         "header_literal_files": ("lookup.py",),
     },
@@ -201,7 +201,10 @@ TABLE = {
             'read_job: AttributeError, UnicodeDecodeError, ValueError',
             'read_job: ValidationError',
         ),
-        'sites': (),
+        'sites': (
+            "json.loads(value.decode('utf-8'), object_pairs_hook=_no_repeated_fields, parse_constant=_no_special_numbers) in read_json x1",
+            "re.compile('[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}') in <module> x1",
+        ),
     },
     'logsafe.py': {
         'imports': (
@@ -214,7 +217,9 @@ TABLE = {
         'names': (),
         'keywords': (),
         'handlers': (),
-        'sites': (),
+        'sites': (
+            "re.sub('[^A-Za-z0-9/_.~%\\\\-]', '?', text) in _safe_text x1",
+        ),
     },
     'lookup.py': {
         'imports': (
@@ -313,8 +318,10 @@ TABLE = {
             'checked_base_url: httpx.InvalidURL',
         ),
         'sites': (
-            'httpx.Client in make_client x1',
-            'self.web.stream in __call__ x1',
+            "environment.get('KNOWLEDGE_URL') in make_client x1",
+            "httpx.Client(base_url=checked_base_url(environment.get('KNOWLEDGE_URL')), timeout=httpx.Timeout(READ_TIMEOUT_SECONDS, connect=CONNECT_TIMEOUT_SECONDS), follow_redirects=False, trust_env=False) in make_client x1",
+            'read_secret(KEY_SETTING) in __call__ x1',
+            "self.web.stream('POST', SEARCH_PATH, json=body, headers={'Authorization': f'Bearer {key}'}) in __call__ x1",
         ),
     },
     'main.py': {
@@ -346,7 +353,13 @@ TABLE = {
             'version',
         ),
         'handlers': (),
-        'sites': (),
+        'sites': (
+            "FastAPI(title='Grader service', version='0.1.0', docs_url=None, redoc_url=None, openapi_url=None) in <module> x1",
+            'app.add_exception_handler(StarletteHTTPException, fixed_http_error) in <module> x1',
+            "app.get('/health') in health x1",
+            "app.get('/ready') in ready x1",
+            "app.middleware('http') in <module> x1",
+        ),
     },
     'provider.py': {
         'imports': (
@@ -401,7 +414,10 @@ TABLE = {
             'read_secret: OSError',
         ),
         'sites': (
-            'open in _read_text x1',
+            "open(path, 'r', encoding='utf-8') in _read_text x1",
+            "os.environ.get(f'{name}_FILE') in read_secret x1",
+            'os.environ.get(name) in read_secret x1',
+            "re.compile('[A-Za-z0-9][A-Za-z0-9._-]*') in <module> x1",
         ),
     },
     'text_rules.py': {
@@ -510,8 +526,18 @@ TABLE = {
             'handle_message: ValueError',
         ),
         'sites': (
-            'consumer.subscribe in run x1',
-            'producer.produce in _deliver x1',
+            'Consumer(consumer_settings(os.environ)) in main x1',
+            'KnowledgeLookup(make_client(os.environ)) in main x1',
+            'Producer(producer_settings(os.environ)) in main x1',
+            "_deliver(producer, DEAD_LETTER_TOPIC, message.key(), message.value(), headers=[('error', reason.encode('utf-8'))]) in run x1",
+            '_deliver(producer, RESULT_TOPIC, detail[0], detail[1]) in run x1',
+            'consumer.subscribe([TOPIC]) in run x1',
+            'consumer_settings(environment) in producer_settings x1',
+            'consumer_settings(os.environ) in main x1',
+            "environment.get('KAFKA_BOOTSTRAP') in consumer_settings x1",
+            'make_client(os.environ) in main x1',
+            'producer.produce(topic, key=key, value=value, headers=headers, on_delivery=lambda error, _message: refused.append(error) if error else None) in _deliver x1',
+            'producer_settings(os.environ) in main x1',
         ),
     },
 }
