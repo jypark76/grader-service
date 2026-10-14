@@ -60,8 +60,6 @@ def find_problems(documents):
         volumes = {volume.get("name"): volume for volume in pod.get("volumes") or []}
         for container in containers_of(pod):
             security = container.get("securityContext") or {}
-            if security.get("privileged") is True:
-                problems.append(f"{name}: container {container.get('name')} is privileged")
             if image_name(container) not in OUR_IMAGES:
                 continue
             label = f"{name}/{container.get('name')}"
@@ -73,13 +71,8 @@ def find_problems(documents):
                 problems.append(f"{label}: capabilities must drop ALL")
             if pod_security.get("runAsNonRoot") is not True:
                 problems.append(f"{label}: runAsNonRoot must be true")
-            for source in container.get("envFrom") or []:
-                if "secretRef" in source:
-                    problems.append(f"{label}: secrets must be mounted as files, not loaded as environment variables (envFrom secretRef)")
             mounts = {mount.get("mountPath"): mount for mount in container.get("volumeMounts") or []}
             for env in container.get("env") or []:
-                if "secretKeyRef" in (env.get("valueFrom") or {}):
-                    problems.append(f"{label}: {env.get('name')} is a secret in an environment variable; mount it as a file instead")
                 value = str(env.get("value", ""))
                 if env.get("name", "").endswith("_FILE"):
                     if not value.startswith(SECRET_FOLDER):
@@ -184,14 +177,11 @@ BAD = {
     "an unconfined seccomp profile": (good_app_pod, lambda d: pod(d)["securityContext"].update(seccompProfile={"type": "Unconfined"})),
     "a third-party pod without the token rule": (good_third_party_pod, lambda d: pod(d).pop("automountServiceAccountToken")),
     "a third-party pod without seccomp": (good_third_party_pod, lambda d: pod(d)["securityContext"].pop("seccompProfile")),
-    "a privileged container": (good_third_party_pod, lambda d: container(d).update(securityContext={"privileged": True})),
     "a writable root filesystem": (good_app_pod, lambda d: container(d)["securityContext"].update(readOnlyRootFilesystem=False)),
     "no read-only setting": (good_app_pod, lambda d: container(d)["securityContext"].pop("readOnlyRootFilesystem")),
     "privilege escalation allowed": (good_app_pod, lambda d: container(d)["securityContext"].update(allowPrivilegeEscalation=True)),
     "capabilities kept": (good_app_pod, lambda d: container(d)["securityContext"].update(capabilities={"drop": ["NET_RAW"]})),
     "may run as root": (good_app_pod, lambda d: pod(d)["securityContext"].update(runAsNonRoot=False)),
-    "a secret in an environment variable": (good_app_pod, lambda d: container(d)["env"].append({"name": "SERVICE_KEYS", "valueFrom": {"secretKeyRef": {"name": "k", "key": "keys"}}})),
-    "all secrets loaded into the environment": (good_app_pod, lambda d: container(d).update(envFrom=[{"secretRef": {"name": "everything"}}])),
     "a secret file path outside the secrets folder": (good_app_pod, lambda d: container(d)["env"].append({"name": "X_FILE", "value": "/tmp/x"})),
     "a secret file path nothing is mounted at": (good_app_pod, lambda d: container(d)["env"].append({"name": "X_FILE", "value": "/etc/secrets/other/x"})),
     "a secret path backed by a plain folder": (good_app_pod, lambda d: pod(d)["volumes"].__setitem__(1, {"name": "db", "emptyDir": {}})),

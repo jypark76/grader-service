@@ -1,4 +1,4 @@
-# In plain English: every file this repo may contain, and every kind of Kubernetes file it may hold. The repo is public, so a file
+# In plain English: every file this repo may contain. The repo is public, so a file
 # that is not on this list (a key file, a .env file, a Kubernetes Secret, a stray notes file) turns tests/test_no_secrets_in_the_repo.py
 # red until a pull request that someone reads adds it here on purpose. A listed file that no longer exists also fails, so the list
 # cannot quietly keep a door open.
@@ -45,20 +45,22 @@ ALLOWED_FILES = (
     'tests/allowed_bad_programs.py',
     'tests/allowed_code.py',
     'tests/allowed_files.py',
+    'tests/allowed_paths.py',
     'tests/allowed_strings.py',
     'tests/allowed_table.py',
     'tests/allowed_text.py',
+    'tests/allowed_yaml.py',
     'tests/conftest.py',
     'tests/owasp_report.py',
     'tests/owasp_tags.py',
     'tests/test_allowed_code.py',
+    'tests/test_allowed_manifests.py',
     'tests/test_dependency_lock.py',
     'tests/test_deprecation_guard.py',
     'tests/test_design_rules.py',
     'tests/test_error_handling.py',
     'tests/test_fixed_destinations.py',
     'tests/test_image_pins.py',
-    'tests/test_internal_only.py',
     'tests/test_jobs.py',
     'tests/test_k8s_manifests.py',
     'tests/test_lookup.py',
@@ -73,13 +75,4 @@ ALLOWED_FILES = (
     'tests/test_supply_chain_pins.py',
     'tests/test_type_checking.py',
     'tests/test_worker.py',
-)
-
-# Kubernetes files may only be of these kinds. A Secret is not one of them: Secrets are made by hand in the cluster and never saved here.
-ALLOWED_KINDS = (
-    'ConfigMap',
-    'Deployment',
-    'Kustomization',
-    'Namespace',
-    'Service',
 )

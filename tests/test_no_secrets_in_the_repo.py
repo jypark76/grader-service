@@ -8,7 +8,7 @@
 #   - every long run of letters, digits, dashes and underscores (20 or more) must read like a name, be a digest or a commit pin, or
 #     be written out in tests/allowed_strings.py with its reason; a real key is random and reads like none of those;
 #   - every "://" outside the tests folder must be followed by a plain host name, never by a name and password;
-#   - a Kubernetes file may only be of an allowed kind, and a Secret is not one.
+#   - (the kinds and settings a Kubernetes file may use are checked in tests/test_allowed_manifests.py; a Secret is not allowed there).
 # Everything is read from the file text, comments included.
 #
 # Why it matters (OWASP A01): sensitive information in source code (CWE-540), in comments (CWE-615) and in files that outsiders can
@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 import allowed_text
-from allowed_files import ALLOWED_FILES, ALLOWED_KINDS
+from allowed_files import ALLOWED_FILES
 from allowed_strings import ALLOWED_STRINGS
 
 ROOT = allowed_text.ROOT
@@ -78,19 +78,6 @@ def test_the_scan_really_reads_the_repo():
     names = {relative for relative, _ in allowed_text.readable_text_files()}
     assert "pytest.ini" in names
     assert len(names) >= 8, names
-
-
-@pytest.mark.owasp("A01", 538, 540)
-@pytest.mark.owasp("A07", 259, 798)
-@pytest.mark.owasp("A02", 260)
-def test_every_kubernetes_file_is_of_an_allowed_kind_and_a_secret_is_not_one():
-    assert "Secret" not in ALLOWED_KINDS
-    used = set()
-    for relative, text in allowed_text.readable_text_files():
-        if relative.endswith((".yaml", ".yml")):
-            used |= allowed_text.kinds_in(text)
-    assert sorted(used - set(ALLOWED_KINDS)) == []
-    assert sorted(set(ALLOWED_KINDS) - used) == [], "an allowed kind nothing uses: remove it from tests/allowed_files.py"
 
 
 @pytest.mark.owasp("A01", 538, 540)
@@ -223,13 +210,6 @@ def test_an_address_carrying_a_name_or_password_is_refused(address):
 )
 def test_a_plain_address_is_not_refused(address):
     assert allowed_text.unexplained_addresses(f"url = '{address}'\n") == []
-
-
-@pytest.mark.owasp("A01", 538, 540)
-def test_a_kubernetes_secret_is_refused_and_ordinary_kinds_are_found():
-    assert allowed_text.kinds_in("apiVersion: v1\nkind: Secret\nmetadata:\n  name: x\n") == {"Secret"}
-    assert allowed_text.kinds_in("kind: Deployment\n---\nkind: Service\n") == {"Deployment", "Service"}
-    assert allowed_text.kinds_in("  kind: Secret\n") == set()  # a nested "kind:" is not the kind of the file
 
 
 @pytest.mark.owasp("A01", 538, 540)

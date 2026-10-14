@@ -12,9 +12,9 @@ claim a rule that nothing checks. To add a rule, add the test first, then a row 
 | No default secrets | A password or key setting never has a built-in default. | `tests/test_allowed_code.py::test_the_rules_that_need_no_table_refuse_their_cases_even_when_everything_is_listed` |
 | Secrets as files | A secret is read from a read-only mounted file, never from the environment. | `tests/test_secret_files.py::test_the_file_is_used_when_it_is_named_and_wins_over_the_plain_setting` |
 | Reveal nothing | An unexpected error gets one fixed reply with nothing from inside. | `tests/test_error_handling.py::test_an_unexpected_error_gets_a_fixed_reply_with_nothing_from_inside` |
-| Internal only | Nothing this repo deploys can be reached from outside the cluster. | `tests/test_internal_only.py::test_nothing_this_repo_deploys_can_be_reached_from_outside_the_cluster` |
+| Internal only | Nothing this repo deploys can be reached from outside the cluster. | `tests/test_allowed_manifests.py::test_every_kubernetes_file_uses_only_allowed_kinds_settings_and_variables` |
 | Hardened pods | Every pod is locked down: no Kubernetes token, default seccomp, read-only filesystem. | `tests/test_pod_hardening.py::test_every_pod_this_repo_deploys_is_locked_down` |
-| Pinned supply chain | Every Python library is pinned exactly and checked by hash. | `tests/test_dependency_lock.py::test_every_library_in_a_lock_is_pinned_exactly_and_has_hashes` |
+| Pinned supply chain | Every Python library is pinned exactly and checked by hash. | `tests/test_dependency_lock.py::test_every_library_in_a_lock_is_pinned_exactly_has_hashes_and_comes_from_nowhere_else` |
 | Pinned images | Every ready-made image is pinned to an exact digest. | `tests/test_image_pins.py::test_every_ready_made_image_in_the_real_files_is_pinned_to_a_digest` |
 | Reviewed cryptography | The only cryptography is the reviewed set; anything new is a deliberate change. | `tests/test_allowed_code.py::test_every_app_file_uses_only_what_its_entry_allows` |
 | No dangerous functions | No shell commands, code evaluation or object loading. | `tests/test_allowed_code.py::test_every_app_file_uses_only_what_its_entry_allows` |

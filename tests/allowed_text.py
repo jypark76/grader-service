@@ -80,11 +80,6 @@ def unexplained_addresses(text):
     return found
 
 
-# In plain English: the kinds of Kubernetes file found in the text, one per "kind:" line at the start of a line.
-def kinds_in(text):
-    return set(re.findall(r"(?m)^kind:\s*(\S+)\s*$", text))
-
-
 # In plain English: the files present that are not on the allowed list, and the listed files that are gone.
 def files_not_on_the_list(present, allowed):
     return sorted(set(present) - set(allowed))

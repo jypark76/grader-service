@@ -49,7 +49,7 @@ weakness that is not claimed. The written design rules, each tied to a named tes
 | Strict job and result messages, contract limits | `tests/test_jobs.py`, `tests/test_reason_codes.py` |
 | No secret in any repo file | `tests/test_no_secrets_in_the_repo.py` |
 | Locked, hash-checked libraries, pinned base image and Actions | `tests/test_dependency_lock.py`, `tests/test_supply_chain_pins.py`, `tests/test_image_pins.py` |
-| Hardened, internal-only pods | `tests/test_pod_hardening.py`, `tests/test_internal_only.py`, `tests/test_k8s_manifests.py` |
+| Hardened, internal-only pods | `tests/test_pod_hardening.py`, `tests/test_allowed_manifests.py`, `tests/test_k8s_manifests.py` |
 | Wrong arguments caught before the program runs (mypy) | `tests/test_type_checking.py` |
 
 Dependency and image scanning run in `.github/workflows/dependency-audit.yml` and
