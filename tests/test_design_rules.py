@@ -13,7 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "design-rules.md"
-MINIMUM_RULES = 27
+MINIMUM_RULES = 33
 TEST_REFERENCE = re.compile(r"`(tests/[a-z0-9_]+\.py)::([A-Za-z0-9_]+)`")
 
 

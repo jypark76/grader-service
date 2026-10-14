@@ -48,6 +48,10 @@ weakness that is not claimed. The written design rules, each tied to a named tes
 | The lookup: one fixed address, no redirects, strict reply, failures stop the worker | `tests/test_lookup.py`, `tests/test_worker.py` |
 | Strict job and result messages, contract limits | `tests/test_jobs.py`, `tests/test_reason_codes.py` |
 | No secret in any repo file | `tests/test_no_secrets_in_the_repo.py` |
+| Only listed imports, calls and names in each code file | `tests/test_allowed_code.py`, `tests/allowed_table.py` |
+| Only listed Dockerfile and .dockerignore lines | `tests/test_allowed_build_files.py` |
+| Only listed settings in each Kubernetes file | `tests/test_allowed_manifests.py`, `tests/allowed_paths.py` |
+| A key cannot be pushed, even in a commit that is later removed | `hooks/check_pushed_commits.py`, `tests/test_pre_push_check.py` |
 | Locked, hash-checked libraries, pinned base image and Actions | `tests/test_dependency_lock.py`, `tests/test_supply_chain_pins.py`, `tests/test_image_pins.py` |
 | Hardened, internal-only pods | `tests/test_pod_hardening.py`, `tests/test_allowed_manifests.py`, `tests/test_k8s_manifests.py` |
 | Wrong arguments caught before the program runs (mypy) | `tests/test_type_checking.py` |
@@ -87,3 +91,12 @@ top of the `.in` file (it needs Docker).
   signed.
 - The key for the knowledge service is a Secret made by hand (`knowledge-lookup-key`); the deploy script checks it exists
   and never creates it.
+
+## Install the pre-push check (once, on your computer)
+
+```bash
+git config core.hooksPath hooks
+```
+
+From then on every `git push` first runs `hooks/check_pushed_commits.py`, which refuses the push if any commit about to leave holds a key,
+a password in an address or a file that is not on `tests/allowed_files.py`.
