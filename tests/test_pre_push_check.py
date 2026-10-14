@@ -266,6 +266,17 @@ def test_a_line_that_starts_with_two_plus_signs_is_still_scanned():
     assert hook.patch_problems(text) != []
 
 
+# In plain English: a folder holding only git and sh (plus whatever the test puts in it), used as the whole PATH, so no Python of the
+# computer running the tests can be found by accident.
+def narrow_path(folder):
+    folder.mkdir(exist_ok=True)
+    for tool in ("git", "sh"):
+        link = folder / tool
+        if not link.exists():
+            link.symlink_to(shutil.which(tool))
+    return str(folder)
+
+
 @pytest.mark.owasp("A01", 540, 615, 538)
 @pytest.mark.parametrize("name", ["python", "python3"])
 def test_the_hook_works_with_either_python_name(pushing_repository, tmp_path, monkeypatch, name):
@@ -277,8 +288,7 @@ def test_the_hook_works_with_either_python_name(pushing_repository, tmp_path, mo
     bin_folder = tmp_path / "only-one-python"
     bin_folder.mkdir()
     (bin_folder / name).symlink_to(sys.executable)
-    git_folder = str(Path(shutil.which("git")).parent)
-    monkeypatch.setenv("PATH", f"{bin_folder}:{git_folder}:/bin")
+    monkeypatch.setenv("PATH", narrow_path(bin_folder))
     honest = real_git(work, "push", "origin", "main", check=False)
     assert honest.returncode == 0, honest.stderr
     (work / "app" / "x.py").write_text(f"x = '{SECRETS['a 64-character hex key']}'\n", encoding="utf-8")
@@ -300,7 +310,7 @@ def test_a_broken_python3_shortcut_is_skipped_and_the_working_python_is_used(pus
     broken.write_text("#!/bin/sh\necho 'Python was not found' >&2\nexit 49\n", encoding="utf-8")
     broken.chmod(0o755)
     (bin_folder / "python").symlink_to(sys.executable)
-    monkeypatch.setenv("PATH", f"{bin_folder}:{Path(shutil.which('git')).parent}:/bin")
+    monkeypatch.setenv("PATH", narrow_path(bin_folder))
     assert real_git(work, "push", "origin", "main", check=False).returncode == 0
     (work / "app" / "x.py").write_text(f"x = '{SECRETS['a 64-character hex key']}'\n", encoding="utf-8")
     real_git(work, "commit", "-q", "-am", "oops")
@@ -317,6 +327,6 @@ def test_when_no_python_works_nothing_is_pushed(pushing_repository, tmp_path, mo
     work, remote = pushing_repository
     empty = tmp_path / "no-python"
     empty.mkdir()
-    monkeypatch.setenv("PATH", f"{empty}:{Path(shutil.which('git')).parent}:/bin")
+    monkeypatch.setenv("PATH", narrow_path(empty))
     refused = real_git(work, "push", "origin", "main", check=False)
     assert refused.returncode != 0 and "no working Python" in refused.stderr
