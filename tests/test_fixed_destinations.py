@@ -1,21 +1,20 @@
 # In plain English: a guardrail that keeps this service from ever reaching a place chosen by someone else. A message or a
 # request must never be able to pick the address the service connects to, or the Kafka topic it reads or writes.
 #
-# HOW IT WORKS, and why it is built this way. There are only two outbound paths in the whole service, and each is one call:
+# HOW IT WORKS. There are only two outbound paths in the whole service, and each is one call:
 #   - the knowledge-service lookup:  self.web.stream("POST", SEARCH_PATH, json=..., headers=...)   in app/lookup.py
 #   - the Kafka send and read:       producer.produce(topic, ...), consumer.subscribe([TOPIC])    in app/worker.py
-# So this test does not try to prove that arbitrary Python goes to a fixed place (that is an arms race with whoever writes the
-# next trick). It PINS those calls, exactly, and bans every other way to reach the web or Kafka:
-#   - only app/lookup.py may import the web library, only as a plain `import httpx`, and only a short list of its names may be used;
+# tests/test_allowed_code.py already makes sure only the listed files import the web library or Kafka, that only listed calls exist
+# anywhere, and that open, the web call, the web client, produce and subscribe appear only at their listed places, exactly once.
+# This test adds what a list of names cannot say, the exact SHAPE of those calls:
 #   - the web client lives in one place (self.web) and may be used for one call with one exact shape: the method "POST", the
 #     address given by the name SEARCH_PATH, and nothing but json and headers; no keyword address, no *args, no **kwargs, no
-#     other method, no copy of the client under another name;
+#     other method, no copy of the client under another name; the client is built once, in make_client, and handed straight back;
 #   - SEARCH_PATH is bound exactly once in the file, by a text written at the top (checked against EVERY way Python can bind a
 #     name, from the language's own list of syntax kinds and from Python's own symbol table, see the tests at the bottom);
-#   - only app/worker.py may call produce or subscribe, each exactly once, with the topic a plain parameter or a constant bound
-#     once at the top, and the send helper may only be called with the two fixed topic constants;
-#   - getattr/setattr/delattr/globals/locals/vars, `import *` and a few dunder attributes are banned everywhere, because each is
-#     a way around everything above.
+#   - produce is called once, inside the send helper _deliver, with the topic an unchanged parameter; subscribe is called once with
+#     a list holding one text constant bound once; the send helper may only be called with the two fixed topic constants and may
+#     never be used as a value (no alias, no partial).
 # Why it matters: if a request or message could pick the address or the topic, an attacker could make the service call an
 # internal system, leak data to their own server or read someone else's topic (OWASP A05 CWE-610, and the server-side request
 # forgery family in A01).
@@ -25,54 +24,21 @@ from pathlib import Path
 
 import pytest
 
+import allowed_code
+from allowed_code import names_bound_by
+from allowed_table import TABLE
+
 APP = Path(__file__).resolve().parent.parent / "app"
 
-# Modules that open connections to other machines. Anything in app/ that uses one must be a deliberate decision, so adding it
-# must change this list.
-OUTBOUND_MODULES = {
-    "requests", "httpx", "urllib", "urllib3", "http", "socket", "aiohttp", "websockets", "ftplib", "smtplib",
-    "telnetlib", "xmlrpc", "poplib", "imaplib", "paramiko", "grpc",
-}
-
-# The one deliberate exception: the file that is allowed to import an outbound module, and which one.
-ALLOWED_OUTBOUND = {"lookup.py": {"httpx"}}
-# The only names of the web library the lookup may use.
+# The names of the web library the lookup may use (tests/test_allowed_code.py lists its other uses).
 HTTPX_NAMES = {"Client", "URL", "Timeout", "InvalidURL", "HTTPError"}
-# Names of methods that send something over a web client. In app/lookup.py only the one pinned call may use one; elsewhere none.
-SENDING_NAMES = {"get", "post", "put", "patch", "delete", "head", "options", "request", "stream", "send", "build_request"}
-# The one file that may talk to Kafka, and the calls it may make.
+# The files whose outbound call has a pinned shape.
+LOOKUP_FILES = {"lookup.py"}
 KAFKA_FILES = {"worker.py"}
-TOPIC_CALLS = {"produce", "subscribe", "assign", "seek", "consume"}
-DANGEROUS_CALLS = {"getattr", "setattr", "delattr", "globals", "locals", "vars"}
-DANGEROUS_ATTRIBUTES = {"__dict__", "__getattribute__", "__globals__", "__builtins__", "__import__", "__class__"}
 STREAM_KEYWORDS = {"json", "headers"}
 PRODUCE_KEYWORDS = {"key", "value", "headers", "on_delivery"}
 FIXED_TOPICS = {"RESULT_TOPIC", "DEAD_LETTER_TOPIC"}
-
-
-# In plain English: every name that ONE piece of code binds, meaning gives a value to, declares, imports, defines or deletes.
-# This list is Python's own: it covers every syntax tree node type that can carry a name (a test below checks the list against the
-# language itself, so a new kind of binding added by a future Python makes a test fail instead of slipping by).
-def names_bound_by(node):
-    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-        return {node.id}  # =, :=, +=, for, with ... as, comprehensions, del, tuple and star unpacking
-    if isinstance(node, ast.arg):
-        return {node.arg}  # every parameter of a def or a lambda, including *args, **kwargs, keyword-only and positional-only
-    if isinstance(node, ast.ExceptHandler):
-        return {node.name} if node.name else set()  # except ... as name, except* ... as name
-    if isinstance(node, ast.alias):
-        return {(node.asname or node.name).split(".")[0]}  # import x, import x as y, from x import y [as z]
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return {node.name}
-    if isinstance(node, (ast.MatchAs, ast.MatchStar)):
-        return {node.name} if node.name else set()
-    if isinstance(node, ast.MatchMapping):
-        return {node.rest} if node.rest else set()
-    if isinstance(node, (ast.Global, ast.Nonlocal)):
-        return set(node.names)  # declaring that a name is rebound from inside a function is itself a re-binding
-    if type(node).__name__ in ("TypeVar", "ParamSpec", "TypeVarTuple"):
-        return {node.name}  # def f[NAME](): ...  and  class C[NAME]: ...
-    return set()
+SEND_HELPER = "_deliver"
 
 
 # In plain English: true if the name is bound exactly once in the whole file, and that one binding is a text written at the top
@@ -130,13 +96,7 @@ def lookup_problems(tree, name):
     # 4. The address name is a text bound once at the top of the file.
     if not is_a_text_constant_bound_once(tree, "SEARCH_PATH"):
         problems.append(f"{name}: SEARCH_PATH must be a text written once at the top of the file and never bound again")
-    # 5. No other method that sends anything. (get, head and options are also ordinary dictionary and settings reads, so on their
-    # own they are not flagged; they cannot be used on a web client anyway, because rule 2 allows the client to be used for only
-    # the one stream call and rule 6 allows no other client to exist.)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in SENDING_NAMES - {"get", "head", "options"} and ast.unparse(node.value) != "self.web":
-            problems.append(f"{name}:{node.lineno}: '{node.attr}' is a sending method and may only be the pinned call on self.web")
-    # 6. The one web client is built in make_client and handed straight back; no other client exists.
+    # 5. The one web client is built in make_client and handed straight back; no other client exists.
     clients = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "httpx.Client"]
     for call in clients:
         function = call
@@ -154,14 +114,14 @@ def kafka_problems(tree, name):
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     produces = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "produce"]
     subscribes = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "subscribe"]
-    others = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute) and node.attr in TOPIC_CALLS - {"produce", "subscribe"}]
-    if len(produces) > 1 or len(subscribes) > 1 or others:
-        problems.append(f"{name}: there may be at most one produce call, one subscribe call and no other topic call")
+    if len(produces) > 1 or len(subscribes) > 1:
+        problems.append(f"{name}: there may be at most one produce call and one subscribe call")
     for call in produces:
         function = call
         while function in parents and not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             function = parents[function]
-        topic_is_a_parameter = isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) and "topic" in {argument.arg for argument in function.args.posonlyargs + function.args.args + function.args.kwonlyargs}
+        in_the_helper = isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) and function.name == SEND_HELPER
+        topic_is_a_parameter = in_the_helper and "topic" in {argument.arg for argument in function.args.posonlyargs + function.args.args + function.args.kwonlyargs}
         rebound = set()
         if topic_is_a_parameter:
             for statement in function.body:
@@ -169,11 +129,11 @@ def kafka_problems(tree, name):
                     rebound |= names_bound_by(part)
         shape_ok = (
             len(call.args) == 1 and isinstance(call.args[0], ast.Name) and call.args[0].id == "topic"
-            and topic_is_a_parameter and "topic" not in rebound
+            and in_the_helper and topic_is_a_parameter and "topic" not in rebound
             and all(keyword.arg in PRODUCE_KEYWORDS for keyword in call.keywords)
         )
         if not shape_ok:
-            problems.append(f"{name}:{call.lineno}: produce must be produce(topic, key=, value=, headers=, on_delivery=) with topic an unchanged parameter")
+            problems.append(f"{name}:{call.lineno}: produce must be produce(topic, key=, value=, headers=, on_delivery=) inside {SEND_HELPER}, with topic an unchanged parameter")
     for call in subscribes:
         topics = call.args[0] if call.args else None
         shape_ok = (
@@ -183,7 +143,11 @@ def kafka_problems(tree, name):
         if not shape_ok:
             problems.append(f"{name}:{call.lineno}: subscribe must be subscribe([NAME]) with NAME a text constant bound once")
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_deliver":
+        if isinstance(node, ast.Name) and node.id == SEND_HELPER and isinstance(node.ctx, ast.Load):
+            holder = parents.get(node)
+            if not (isinstance(holder, ast.Call) and holder.func is node):
+                problems.append(f"{name}:{node.lineno}: {SEND_HELPER} may be called but never used as a value (no alias, no partial)")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == SEND_HELPER:
             fixed = (
                 len(node.args) >= 2 and not any(isinstance(argument, ast.Starred) for argument in node.args)
                 and isinstance(node.args[1], ast.Name) and node.args[1].id in FIXED_TOPICS
@@ -191,43 +155,25 @@ def kafka_problems(tree, name):
                 and all(keyword.arg not in (None, "topic") for keyword in node.keywords)
             )
             if not fixed:
-                problems.append(f"{name}:{node.lineno}: _deliver must be called with one of {sorted(FIXED_TOPICS)} as its topic")
+                problems.append(f"{name}:{node.lineno}: {SEND_HELPER} must be called with one of {sorted(FIXED_TOPICS)} as its topic")
     return problems
 
 
-# In plain English: reads one program's text and returns plain sentences, one per problem, each with its line number.
-def find_unfixed_destinations(source, name="<code>"):
+# In plain English: only the shapes of the pinned calls (the list of allowed names is tests/test_allowed_code.py).
+def pinned_problems(source, name="<code>"):
     tree = ast.parse(source)
     base = name.rsplit("/", 1)[-1]
-    allowed = ALLOWED_OUTBOUND.get(base, set())
     problems = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in OUTBOUND_MODULES and root not in allowed:
-                    problems.append(f"{name}:{node.lineno}: imports '{alias.name}', which opens connections to other machines")
-                if root in allowed and (alias.asname or alias.name != root):
-                    problems.append(f"{name}:{node.lineno}: the web library must be imported plainly as 'import {root}'")
-        elif isinstance(node, ast.ImportFrom):
-            if (node.module or "").split(".")[0] in OUTBOUND_MODULES:
-                problems.append(f"{name}:{node.lineno}: imports from '{node.module}', which opens connections to other machines")
-            if any(alias.name == "*" for alias in node.names):
-                problems.append(f"{name}:{node.lineno}: 'import *' can silently re-bind any name")
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_CALLS:
-            problems.append(f"{name}:{node.lineno}: calls '{node.func.id}', which can reach any name or attribute")
-        elif isinstance(node, ast.Attribute):
-            if node.attr in DANGEROUS_ATTRIBUTES:
-                problems.append(f"{name}:{node.lineno}: uses '{node.attr}', which can reach any name or attribute")
-            if node.attr in SENDING_NAMES and not allowed and node.attr not in ("get", "head", "options"):
-                problems.append(f"{name}:{node.lineno}: '{node.attr}' sends over a web client, which only app/lookup.py may do")
-            if node.attr in TOPIC_CALLS and base not in KAFKA_FILES:
-                problems.append(f"{name}:{node.lineno}: '{node.attr}' talks to Kafka, which only app/worker.py may do")
-    if allowed:
+    if base in LOOKUP_FILES:
         problems += lookup_problems(tree, name)
     if base in KAFKA_FILES:
         problems += kafka_problems(tree, name)
     return problems
+
+
+# In plain English: the whole check for one file: the pinned shapes, and everything the allowed table refuses.
+def find_unfixed_destinations(source, name="<code>"):
+    return pinned_problems(source, name) + allowed_code.compare(source, name, TABLE)[0]
 
 
 def app_files():
@@ -251,7 +197,7 @@ def test_application_code_reaches_only_fixed_destinations():
 def test_the_check_covers_the_real_application_files():
     names = {path.name for path in app_files()}
     assert {"main.py", "errors.py", "secret_files.py", "logsafe.py", "lookup.py", "worker.py"} <= names
-    assert ALLOWED_OUTBOUND == {"lookup.py": {"httpx"}} and KAFKA_FILES == {"worker.py"}
+    assert LOOKUP_FILES == {"lookup.py"} and KAFKA_FILES == {"worker.py"}
 
 
 # A good lookup file and a good worker file, written out in full. Every bad program below is one of these with one change.
@@ -547,34 +493,39 @@ SIMPLE_BAD = {
     "a sending method outside the lookup": "def f(c, u):\n    c.post(u)\n",
     "a sending method with a fixed address outside the lookup": "def f(c):\n    c.post('/x')\n",
 }
-SIMPLE_GOOD = {
-    "the database driver": "import psycopg\n",
-    "the kafka client": "from confluent_kafka import Consumer\n",
-    "the word in a comment": "# we never import requests or socket here\nx = 1\n",
-    "the word in a string": "text = 'import requests'\n",
-    "an ordinary dictionary lookup": "def f(d, k):\n    return d.get(k)\n",
-    "a settings lookup": "def f(environment):\n    return environment.get('X')\n",
-    "an ordinary method named like a verb": "def f(o):\n    return o.close()\n",
-    "importing a name that contains star": "from os import path\n",
-}
 
 
 @pytest.mark.owasp("A05", 610)
 @pytest.mark.parametrize("label", sorted(SIMPLE_BAD))
-def test_every_banned_construct_is_caught_in_any_file(label):
-    assert find_unfixed_destinations(SIMPLE_BAD[label], "app/other.py") != [], f"not caught: {label}"
+def test_every_other_way_to_reach_out_is_refused_in_the_files_that_hold_the_pinned_calls(label):
+    for filename in ("app/worker.py", "app/lookup.py"):
+        assert find_unfixed_destinations(SIMPLE_BAD[label], filename) != [], f"not caught in {filename}: {label}"
+
+
+# ---------- Findings from reviews, kept as tests so they can never come back ----------
+
+# Each is the good worker plus one extra function. They were found by reviewers, one by one, while the guardrail still worked by
+# listing forbidden things. Now none of them is on the allowed list, so each is refused.
+REVIEWED = {
+    "a client from make_client used to call any address": "def extra(env, m):\n    return make_client(env).get(m.url)\n",
+    "the web library taken from the lookup module": "from app.lookup import httpx\n\n\ndef extra(m):\n    return httpx.get(m.url)\n",
+    "the send helper copied to another name": "def extra(producer, m):\n    d = _deliver\n    d(producer, m.topic, 1, 2)\n",
+    "the send helper wrapped in functools.partial": "import functools\n\n\ndef extra(producer, m):\n    functools.partial(_deliver, producer, m.topic)()\n",
+    "the send helper renamed, with a computed topic": "def _send(producer, topic, key, value, headers=None):\n    producer.produce(topic, key=key, value=value)\n\n\ndef extra(producer, m):\n    _send(producer, m.topic, 1, 2)\n",
+    "a socket opened by asyncio": "import asyncio\n\n\nasync def extra(m):\n    return await asyncio.open_connection(m.host, 80)\n",
+    "a connection made by anyio": "import anyio\n",
+    "a connection made by multiprocessing": "import multiprocessing.connection\n",
+    "a module nobody listed": "import nntplib\n",
+}
 
 
 @pytest.mark.owasp("A05", 610)
-@pytest.mark.parametrize("label", sorted(SIMPLE_GOOD))
-def test_ordinary_code_is_not_flagged(label):
-    assert find_unfixed_destinations(SIMPLE_GOOD[label], "app/other.py") == [], f"wrongly flagged: {label}"
-
-
-@pytest.mark.owasp("A05", 610)
-def test_a_problem_names_the_line():
-    problems = find_unfixed_destinations("x = 1\ny = 2\nimport socket\n", "app/x.py")
-    assert problems and problems[0].startswith("app/x.py:3:")
+@pytest.mark.owasp("A01", 918, 441)
+@pytest.mark.parametrize("label", sorted(REVIEWED))
+def test_every_gap_a_reviewer_found_is_closed(label):
+    source = worker(GOOD_PRODUCE) + "\n\n" + REVIEWED[label]
+    compile(source, label, "exec")
+    assert find_unfixed_destinations(source, "app/worker.py") != [], f"not caught: {label}"
 
 
 # ---------------------------------------------------------------------------
@@ -660,12 +611,12 @@ def lookup_with_binding(name, binding):
 def test_every_way_of_binding_the_address_name_is_caught(label, binding):
     caught = lookup_with_binding("SEARCH_PATH", binding)
     compile(caught, label, "exec")
-    assert find_unfixed_destinations(caught, "app/lookup.py") != [], f"not caught: {label}"
-    assert find_unfixed_destinations(lookup_with_binding("SEARCH_PATH", "pass"), "app/lookup.py") == [], f"the control wrongly fails: {label}"
+    assert pinned_problems(caught, "app/lookup.py") != [], f"not caught: {label}"
+    assert pinned_problems(lookup_with_binding("SEARCH_PATH", "pass"), "app/lookup.py") == [], f"the control wrongly fails: {label}"
     # also when the binding sits in a method that makes no call at all
     elsewhere = lookup(GOOD_CALL) + "\n    def other(self, m, items):\n" + textwrap.indent(binding.replace("NAME", "SEARCH_PATH"), "        ") + "\n"
     compile(elsewhere, label, "exec")
-    assert find_unfixed_destinations(elsewhere, "app/lookup.py") != [], f"not caught in another method: {label}"
+    assert pinned_problems(elsewhere, "app/lookup.py") != [], f"not caught in another method: {label}"
 
 
 @pytest.mark.owasp("A05", 610)
@@ -674,7 +625,7 @@ def test_every_way_of_binding_the_address_name_is_caught(label, binding):
 def test_a_parameter_named_like_the_address_is_caught(label, parameter):
     source = lookup(GOOD_CALL).replace("def __call__(self, job):", f"def __call__(self, {parameter.replace('NAME', 'SEARCH_PATH')}):")
     compile(source, label, "exec")
-    assert find_unfixed_destinations(source, "app/lookup.py") != [], f"not caught: {label}"
+    assert pinned_problems(source, "app/lookup.py") != [], f"not caught: {label}"
 
 
 @pytest.mark.owasp("A05", 610)
@@ -693,8 +644,8 @@ def test_every_way_of_binding_the_topic_parameter_is_caught_wherever_it_sits(lab
     for layout in ("before", "after", "middle"):
         caught = program(binding.replace("NAME", "topic"), layout)
         compile(caught, label, "exec")
-        assert find_unfixed_destinations(caught, "app/worker.py") != [], f"not caught: {label}, {layout}"
-        assert find_unfixed_destinations(program("pass", layout), "app/worker.py") == [], f"the control wrongly fails: {label}, {layout}"
+        assert pinned_problems(caught, "app/worker.py") != [], f"not caught: {label}, {layout}"
+        assert pinned_problems(program("pass", layout), "app/worker.py") == [], f"the control wrongly fails: {label}, {layout}"
 
 
 @pytest.mark.owasp("A05", 610)
@@ -703,7 +654,7 @@ def test_every_way_of_binding_the_topic_parameter_is_caught_wherever_it_sits(lab
 def test_every_way_of_binding_a_topic_constant_is_caught(label, binding):
     source = worker(GOOD_PRODUCE) + "\n\ndef other(m, items):\n" + textwrap.indent(binding.replace("NAME", "RESULT_TOPIC"), "    ") + "\n"
     compile(source, label, "exec")
-    assert find_unfixed_destinations(source, "app/worker.py") != [], f"not caught: {label}"
+    assert pinned_problems(source, "app/worker.py") != [], f"not caught: {label}"
 
 
 @pytest.mark.owasp("A05", 610)
@@ -712,7 +663,7 @@ def test_a_nested_function_parameter_with_the_topics_name_is_caught(label, param
     body = f"    def inner({parameter.replace('NAME', 'topic')}):\n        pass\n    producer.produce(topic, key=key)"
     source = worker(body)
     compile(source, label, "exec")
-    assert find_unfixed_destinations(source, "app/worker.py") != [], f"not caught: {label}"
+    assert pinned_problems(source, "app/worker.py") != [], f"not caught: {label}"
 
 
 @pytest.mark.owasp("A05", 610)
@@ -720,7 +671,7 @@ def test_a_nested_function_parameter_with_the_topics_name_is_caught(label, param
 def test_a_star_parameter_is_never_the_topic(parameter):
     source = worker(GOOD_PRODUCE).replace("def _deliver(producer, topic, key, value, headers=None):", f"def _deliver(producer, {parameter}):")
     compile(source, "star", "exec")
-    assert find_unfixed_destinations(source, "app/worker.py") != []
+    assert pinned_problems(source, "app/worker.py") != []
 
 
 # In plain English: the table above must cover EVERY kind of syntax that can carry a name. This lists those kinds from the language

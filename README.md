@@ -19,7 +19,7 @@ cluster can ask the grader to do anything over HTTP, because it does its work fr
 ## Decisions that shape this service
 
 - **No database.** The grader is stateless: jobs and results travel over Kafka. A test fails if a
-  database library, a SQL file or a `db/` folder ever appears (`tests/test_no_database.py`).
+  database library, a SQL file or a `db/` folder ever appears (`tests/test_allowed_code.py`).
 - **No AI and no AWS yet.** The first model call will be to a fake provider. Bedrock comes after
   that, through one AWS role that may call only `InvokeModel` on one model in one region, with a
   monthly spending alarm, and its credentials mounted as a file.
@@ -39,11 +39,11 @@ weakness that is not claimed. The written design rules, each tied to a named tes
 | Guardrail | Test file |
 |---|---|
 | The exact list of routes, docs closed, odd address spellings | `tests/test_routes.py` |
-| Fixed error replies and safe log lines | `tests/test_error_handling.py`, `tests/test_error_handling_rules.py` |
+| Fixed error replies and safe log lines | `tests/test_error_handling.py`, `tests/test_allowed_code.py` |
 | Replies labelled JSON, no request text in reply headers | `tests/test_replies.py` |
-| No shell, eval or object loading; no file access; no uploads | `tests/test_forbidden_calls.py`, `tests/test_no_file_access.py`, `tests/test_no_file_uploads.py` |
-| Only reviewed cryptography | `tests/test_cryptography_rules.py` |
-| Settings fixed at deploy time, nothing identifies a caller except a key | `tests/test_configuration_rules.py`, `tests/test_identity_rules.py` |
+| No shell, eval or object loading; no file access; no uploads | `tests/test_allowed_code.py` |
+| Only reviewed cryptography | `tests/test_allowed_code.py` |
+| Settings fixed at deploy time, nothing identifies a caller except a key | `tests/test_allowed_code.py` |
 | Secrets read only from mounted files under `/etc/secrets` | `tests/test_secret_files.py` |
 | The lookup: one fixed address, no redirects, strict reply, failures stop the worker | `tests/test_lookup.py`, `tests/test_worker.py` |
 | Strict job and result messages, contract limits | `tests/test_jobs.py`, `tests/test_reason_codes.py` |
