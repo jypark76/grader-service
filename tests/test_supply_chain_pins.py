@@ -218,6 +218,27 @@ def test_every_workflow_uses_only_allowed_building_blocks():
     assert found
 
 
+# The check that the built image holds exactly the code and the list of libraries, word for word. Whatever else might land in the
+# image, a key file, a note, a test, makes the two lists differ, so no list of suspicious names is needed.
+IMAGE_FILES_RUN = """\
+expected="$( (find app -type f | sed 's#^#/app/#'; echo /app/requirements.txt) | sort)"
+actual="$(docker exec image-test find /app -type f | sort)"
+if [ "$actual" != "$expected" ]; then
+  echo "The files inside the image are not exactly the code and the list of libraries:" >&2
+  echo "$actual" >&2
+  exit 1
+fi"""
+
+
+@pytest.mark.owasp("A01", 538, 540)
+def test_the_image_is_checked_to_hold_exactly_the_code_and_the_list_of_libraries():
+    need_image()
+    document = yaml.safe_load((WORKFLOWS / "tests.yml").read_text(encoding="utf-8"))
+    steps = [step for job in document["jobs"].values() for step in job["steps"] if step.get("name") == "Check only the expected files are inside"]
+    assert len(steps) == 1 and steps[0]["run"].strip() == IMAGE_FILES_RUN
+    assert "if" not in steps[0]
+
+
 @pytest.mark.owasp("A03", 1035, 1395)
 @pytest.mark.parametrize("name", sorted(EXPECTED_STEPS))
 def test_the_scan_workflows_have_exactly_the_expected_steps(name):

@@ -127,20 +127,16 @@ jobs:
             exit 1
           fi
 
-      # Only the code and the list of libraries (the Dockerfile copies it in to install them) should be in
-      # /app. The tests, the Kubernetes files and any notes must stay out, and so must anything that looks like
-      # a secret.
+      # Only the code (every file in the app folder of this checkout) and the list of libraries should be in /app,
+      # and nothing else: the list of files inside the image must equal that list exactly. The tests, the Kubernetes
+      # files, notes and anything else, whatever its name, would make the two lists differ.
       - name: Check only the expected files are inside
         run: |
-          contents="$(docker exec image-test ls -A /app | sort | tr '\n' ' ')"
-          if [ "$contents" != "app requirements.txt " ]; then
-            echo "Unexpected files in /app: $contents" >&2
-            exit 1
-          fi
-          suspicious="$(docker exec image-test find /app \( -name '.env*' -o -name '*.pem' -o -name '*.key' -o -iname '*secret*' \) ! -path /app/app/secret_files.py)"
-          if [ -n "$suspicious" ]; then
-            echo "Files that look like secrets are inside the image:" >&2
-            echo "$suspicious" >&2
+          expected="$( (find app -type f | sed 's#^#/app/#'; echo /app/requirements.txt) | sort)"
+          actual="$(docker exec image-test find /app -type f | sort)"
+          if [ "$actual" != "$expected" ]; then
+            echo "The files inside the image are not exactly the code and the list of libraries:" >&2
+            echo "$actual" >&2
             exit 1
           fi
 
