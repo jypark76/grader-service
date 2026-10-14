@@ -31,6 +31,7 @@ TABLE = {
             'For',
             'FormattedValue',
             'FunctionDef',
+            'GeneratorExp',
             'Gt',
             'If',
             'IfExp',
@@ -367,17 +368,20 @@ TABLE = {
         'imports': (
             'from pathlib import PurePosixPath',
             'import os',
+            'import re',
         ),
         'calls': (
             'PurePosixPath',
             'RuntimeError',
+            'SAFE_NAME.fullmatch',
             '_is_allowed',
             '_read_text',
+            'all',
             'handle.read',
             'len',
             'open',
             'os.environ.get',
-            'path_text.strip',
+            're.compile',
             'text.endswith',
         ),
         'values': (
@@ -386,6 +390,7 @@ TABLE = {
         'names': (
             'OSError',
             'RuntimeError',
+            'all',
             'len',
             'open',
         ),

@@ -4,15 +4,19 @@
 # Secret reaches the file without restarting the pod.
 #
 # This is the only place in app/ that opens a file, and it is strict:
-#   - the path must be inside /etc/secrets (where the Secrets are mounted), written without "..", so a wrong or
-#     tampered setting can never make the service read some other file;
+#   - the path must be inside /etc/secrets (where the Secrets are mounted) and every name below it may only use letters,
+#     digits, dot, dash and underscore and must start with a letter or digit, so a wrong or tampered setting ("..",
+#     a null character, a space, a newline) can never make the service read some other file;
 #   - if the file cannot be read the service stops (RuntimeError), it never falls back to something open;
 #   - only the final line break is removed from the text, nothing else;
 #   - the text is returned, never logged, and never put in an error message.
 import os
+import re
 from pathlib import PurePosixPath
 
 SECRET_FOLDER = ("/", "etc", "secrets")
+# The only kind of name a folder or file below /etc/secrets may have: starts with a letter or digit, then letters, digits, dot, dash or underscore.
+SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 # In plain English: the one place a file is opened. Tests replace it so they need no real files.
@@ -21,14 +25,13 @@ def _read_text(path):
         return handle.read()
 
 
-# In plain English: true only for a path with at least one name below /etc/secrets and no "..". A path that does
-# not start with "/etc/secrets" (a relative path, another folder, a look-alike such as /etc/secretsX) fails the
-# first test, and PurePosixPath has already folded any "." parts away.
+# In plain English: true only for a path with at least one name below /etc/secrets where every name is made of the
+# allowed characters. A path that does not start with "/etc/secrets" (a relative path, another folder, a look-alike such
+# as /etc/secretsX) fails the first test, and PurePosixPath has already folded any "." parts away. Anything else, such as
+# "..", a null character, a space or a line break, is not in the allowed kind of name.
 def _is_allowed(path_text):
-    if not path_text.strip() or "\x00" in path_text:
-        return False
     parts = PurePosixPath(path_text).parts
-    return parts[:3] == SECRET_FOLDER and len(parts) > 3 and ".." not in parts
+    return parts[:3] == SECRET_FOLDER and len(parts) > 3 and all(SAFE_NAME.fullmatch(part) for part in parts[3:])
 
 
 # In plain English: returns the secret called NAME, from the file named by NAME_FILE if that is set, otherwise from

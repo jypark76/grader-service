@@ -8,7 +8,7 @@
 # the file without restarting the pod.
 #
 # The file reader is the one place in app/ allowed to open a file. It may open only a path inside /etc/secrets,
-# never a path with "..", and a file it cannot read stops the service (it never falls back to something open).
+# only names made of letters, digits, dot, dash and underscore, and a file it cannot read stops the service (it never falls back to something open).
 import logging
 
 import pytest
@@ -103,6 +103,13 @@ def test_paths_inside_the_secrets_folder_are_allowed(monkeypatch, files, path):
         "/proc/self/environ",
         "/app/model_cache/anything",
         "   ",
+        "/etc/secrets/thing/.hidden",
+        "/etc/secrets/thing/..data",
+        "/etc/secrets/thing/val ue",
+        "/etc/secrets/thing/value\n",
+        "/etc/secrets/thing/val\u00fce",
+        "/etc/secrets/thing/a;b",
+        "/etc/secrets/thing/-value",
     ],
 )
 def test_any_other_path_is_refused_before_a_file_is_opened(monkeypatch, files, path):
