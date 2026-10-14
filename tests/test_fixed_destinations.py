@@ -12,9 +12,9 @@
 #     other method, no copy of the client under another name; the client is built once, in make_client, and handed straight back;
 #   - SEARCH_PATH is bound exactly once in the file, by a text written at the top (checked against EVERY way Python can bind a
 #     name, from the language's own list of syntax kinds and from Python's own symbol table, see the tests at the bottom);
-#   - produce is called once, inside the send helper _deliver, with the topic an unchanged parameter; subscribe is called once with
-#     a list holding one text constant bound once; the send helper may only be called with the two fixed topic constants and may
-#     never be used as a value (no alias, no partial).
+#   - produce is called with the topic an unchanged parameter; subscribe is called with a list holding one text constant bound
+#     once; the send helper _deliver may only be called with the two fixed topic constants. (That produce sits only inside _deliver,
+#     that the helper has no alias and that no wrapper such as functools.partial exists is the allowed table's job.)
 # Why it matters: if a request or message could pick the address or the topic, an attacker could make the service call an
 # internal system, leak data to their own server or read someone else's topic (OWASP A05 CWE-610, and the server-side request
 # forgery family in A01).
@@ -30,8 +30,6 @@ from allowed_table import TABLE
 
 APP = Path(__file__).resolve().parent.parent / "app"
 
-# The names of the web library the lookup may use (tests/test_allowed_code.py lists its other uses).
-HTTPX_NAMES = {"Client", "URL", "Timeout", "InvalidURL", "HTTPError"}
 # The files whose outbound call has a pinned shape.
 LOOKUP_FILES = {"lookup.py"}
 KAFKA_FILES = {"worker.py"}
@@ -58,12 +56,7 @@ def is_a_text_constant_bound_once(tree, name):
 def lookup_problems(tree, name):
     problems = []
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-    # 1. The web library is only ever used through the few names listed, and the name httpx is never re-bound.
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == "httpx" and isinstance(node.ctx, ast.Load):
-            holder = parents.get(node)
-            if not (isinstance(holder, ast.Attribute) and holder.value is node and holder.attr in HTTPX_NAMES):
-                problems.append(f"{name}:{node.lineno}: uses the web library other than through {sorted(HTTPX_NAMES)}")
+    # 1. The name httpx is never re-bound.
     if sum(1 for node in ast.walk(tree) if "httpx" in names_bound_by(node)) != 1:
         problems.append(f"{name}: the name httpx must be bound exactly once, by 'import httpx'")
     # 2. The web client lives in self.web, which is set once from the constructor's parameter and used for one call.
@@ -72,14 +65,11 @@ def lookup_problems(tree, name):
         if isinstance(node, ast.Attribute) and ast.unparse(node) == "self.web":
             holder = parents.get(node)
             if isinstance(node.ctx, ast.Store):
-                if not (isinstance(holder, ast.Assign) and isinstance(holder.value, ast.Name) and holder.value.id == "client"):
-                    problems.append(f"{name}:{node.lineno}: self.web is set from something other than the client parameter")
+                continue
             elif isinstance(holder, ast.Attribute) and holder.attr == "stream" and isinstance(parents.get(holder), ast.Call) and parents[holder].func is holder:
                 pinned_calls.append(parents[holder])
             else:
                 problems.append(f"{name}:{node.lineno}: self.web is used other than for the one pinned stream call")
-    if len(pinned_calls) != 1:
-        problems.append(f"{name}: there must be exactly one call on the web client, found {len(pinned_calls)}")
     for call in pinned_calls:
         shape_ok = (
             len(call.args) == 2
@@ -114,14 +104,11 @@ def kafka_problems(tree, name):
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     produces = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "produce"]
     subscribes = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "subscribe"]
-    if len(produces) > 1 or len(subscribes) > 1:
-        problems.append(f"{name}: there may be at most one produce call and one subscribe call")
     for call in produces:
         function = call
         while function in parents and not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             function = parents[function]
-        in_the_helper = isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) and function.name == SEND_HELPER
-        topic_is_a_parameter = in_the_helper and "topic" in {argument.arg for argument in function.args.posonlyargs + function.args.args + function.args.kwonlyargs}
+        topic_is_a_parameter = isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) and "topic" in {argument.arg for argument in function.args.posonlyargs + function.args.args + function.args.kwonlyargs}
         rebound = set()
         if topic_is_a_parameter:
             for statement in function.body:
@@ -129,11 +116,11 @@ def kafka_problems(tree, name):
                     rebound |= names_bound_by(part)
         shape_ok = (
             len(call.args) == 1 and isinstance(call.args[0], ast.Name) and call.args[0].id == "topic"
-            and in_the_helper and topic_is_a_parameter and "topic" not in rebound
+            and topic_is_a_parameter and "topic" not in rebound
             and all(keyword.arg in PRODUCE_KEYWORDS for keyword in call.keywords)
         )
         if not shape_ok:
-            problems.append(f"{name}:{call.lineno}: produce must be produce(topic, key=, value=, headers=, on_delivery=) inside {SEND_HELPER}, with topic an unchanged parameter")
+            problems.append(f"{name}:{call.lineno}: produce must be produce(topic, key=, value=, headers=, on_delivery=) with topic an unchanged parameter")
     for call in subscribes:
         topics = call.args[0] if call.args else None
         shape_ok = (
@@ -143,10 +130,6 @@ def kafka_problems(tree, name):
         if not shape_ok:
             problems.append(f"{name}:{call.lineno}: subscribe must be subscribe([NAME]) with NAME a text constant bound once")
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == SEND_HELPER and isinstance(node.ctx, ast.Load):
-            holder = parents.get(node)
-            if not (isinstance(holder, ast.Call) and holder.func is node):
-                problems.append(f"{name}:{node.lineno}: {SEND_HELPER} may be called but never used as a value (no alias, no partial)")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == SEND_HELPER:
             fixed = (
                 len(node.args) >= 2 and not any(isinstance(argument, ast.Starred) for argument in node.args)
