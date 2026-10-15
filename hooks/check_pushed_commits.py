@@ -6,8 +6,12 @@
 # It reads every commit that is about to be pushed and applies the same allowed lists as tests/test_no_secrets_in_the_repo.py:
 #   - a file added by a pushed commit must be on tests/allowed_files.py;
 #   - every long string on an added line must read like a name, be a digest or a commit pin, or be on tests/allowed_strings.py;
-#   - an added web address must have a plain host name, never a name and password in front of it (outside the tests folder).
-# It uses only what Python ships with, so it needs nothing installed. Install it once with:   git config core.hooksPath hooks
+#   - an added web address must have a plain host name, never a name and password in front of it (outside the tests folder);
+#   - the secret detector (tests/detect_layer.py) must find nothing in the added lines that is not on tests/allowed_detections.py. It is an
+#     extra layer for short passwords the lists above cannot judge. It needs detect-secrets installed: if it is missing the push is
+#     refused with the install command, because a check that cannot run must never look like a check that passed.
+# Install the hook once with:   git config core.hooksPath hooks
+# Install the detector once with:   python -m pip install --require-hashes -r requirements-dev.txt
 import re
 import subprocess
 import sys
@@ -17,6 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 
 import allowed_text  # noqa: E402
+import detect_layer  # noqa: E402
+from allowed_detections import ALLOWED_DETECTIONS  # noqa: E402
 from allowed_files import ALLOWED_FILES  # noqa: E402
 from allowed_strings import ALLOWED_STRINGS  # noqa: E402
 
@@ -48,9 +54,10 @@ def added_in(patch_text):
 
 
 # In plain English: everything wrong with the added lines and files of a patch, as plain sentences.
-def patch_problems(patch_text, allowed_files=None, allowed_strings=None):
+def patch_problems(patch_text, allowed_files=None, allowed_strings=None, allowed_detections=None):
     allowed_files = ALLOWED_FILES if allowed_files is None else allowed_files
     allowed_strings = ALLOWED_STRINGS if allowed_strings is None else allowed_strings
+    allowed_detections = ALLOWED_DETECTIONS if allowed_detections is None else allowed_detections
     lines, files = added_in(patch_text)
     problems = [f"{name}: a new file that is not on tests/allowed_files.py" for name in allowed_text.files_not_on_the_list(files, allowed_files)]
     for name, text in lines:
@@ -58,6 +65,12 @@ def patch_problems(patch_text, allowed_files=None, allowed_strings=None):
             problems.append(f"{name}: an added {len(token)}-character string that does not read like a name")
         if not name.startswith("tests/") and allowed_text.unexplained_addresses(text + "\n"):
             problems.append(f"{name}: an added address that carries a name or password")
+    added_by_file = {}
+    for name, text in lines:
+        added_by_file.setdefault(name, []).append(text)
+    for name, texts in added_by_file.items():
+        for _, kind in detect_layer.unlisted_detections(name, "\n".join(texts) + "\n", allowed_detections):
+            problems.append(f"{name}: the secret detector found a {kind} on an added line")
     return problems
 
 
@@ -82,7 +95,11 @@ def main(standard_input):
         if len(parts) != 4:
             problems.append("git sent a line this check does not understand, so nothing is pushed")
             continue
-        problems += patch_problems(patch_of_push(parts[1], parts[3]))
+        try:
+            problems += patch_problems(patch_of_push(parts[1], parts[3]))
+        except detect_layer.DetectorMissing as error:
+            print(f"Nothing was pushed: {error}", file=sys.stderr)
+            return 1
     if problems:
         print("Nothing was pushed. These commits hold something that is not allowed in a public repo:", file=sys.stderr)
         for problem in sorted(set(problems)):

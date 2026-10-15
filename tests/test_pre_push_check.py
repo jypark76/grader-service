@@ -88,14 +88,15 @@ def test_a_new_file_must_be_on_the_allowed_list():
 def test_an_address_with_a_name_and_password_is_refused_outside_the_tests_folder_only():
     line = f"url = '{ADDRESS_WITH_PASSWORD}'"
     assert hook.patch_problems(patch("app/x.py", [line], new=False)) != []
-    assert hook.patch_problems(patch("tests/x.py", [line], new=False)) == []
+    in_tests = hook.patch_problems(patch("tests/x.py", [line], new=False))
+    assert not any("address" in problem for problem in in_tests)  # the address rule leaves the tests folder alone (the detector still looks)
 
 
 @pytest.mark.owasp("A01", 540, 615, 538)
 def test_a_string_on_the_allowed_list_is_not_refused():
     secret = SECRETS["a 64-character hex key"]
     assert hook.patch_problems(patch("tests/x.py", [f"v = '{secret}'"], new=False)) != []
-    assert hook.patch_problems(patch("tests/x.py", [f"v = '{secret}'"], new=False), allowed_strings={secret: "made up"}) == []
+    assert hook.patch_problems(patch("tests/x.py", [f"v = '{secret}'"], new=False), allowed_strings={secret: "made up"}, allowed_detections={("tests/x.py", secret): "made up"}) == []
 
 
 @pytest.mark.owasp("A01", 540, 615, 538)
@@ -201,10 +202,10 @@ def pushing_repository(tmp_path):
     (work / "app").mkdir()
     for name in ("pre-push", "check_pushed_commits.py"):
         shutil.copy2(ROOT / "hooks" / name, work / "hooks" / name)
-    for name in ("allowed_text.py", "allowed_strings.py"):
+    for name in ("allowed_text.py", "allowed_strings.py", "detect_layer.py", "allowed_detections.py"):
         shutil.copy2(ROOT / "tests" / name, work / "tests" / name)
     (work / "tests" / "allowed_files.py").write_text(
-        'ALLOWED_FILES = ("app/x.py", "hooks/check_pushed_commits.py", "hooks/pre-push", "tests/allowed_files.py", "tests/allowed_strings.py", "tests/allowed_text.py")\n',
+        'ALLOWED_FILES = ("app/x.py", "hooks/check_pushed_commits.py", "hooks/pre-push", "tests/allowed_detections.py", "tests/allowed_files.py", "tests/allowed_strings.py", "tests/allowed_text.py", "tests/detect_layer.py")\n',
         encoding="utf-8",
     )
     (work / "app" / "x.py").write_text("x = 1\n", encoding="utf-8")
@@ -320,3 +321,59 @@ def test_when_no_python_works_nothing_is_pushed(pushing_repository, tmp_path, mo
     monkeypatch.setenv("PATH", narrow_path(empty))
     refused = real_git(work, "push", "origin", "main", check=False)
     assert refused.returncode != 0 and "no working Python" in refused.stderr
+
+
+# ---------- The secret detector, as a second layer ----------
+
+PASSWORD = made("hunter2", "pw")
+
+
+@pytest.mark.owasp("A07", 259, 798)
+@pytest.mark.owasp("A01", 540, 615, 538)
+@pytest.mark.parametrize(
+    "path, line",
+    [
+        ("app/x.py", made("password = \"", PASSWORD, "\"")),
+        ("app/x.py", made("api_key = \"", "Zq8vK3", "mTx\"")),
+        ("k8s/base/x.yaml", made("password: ", PASSWORD)),
+        ("x.env", made("PASSWORD=", PASSWORD)),
+        ("k8s/x.sh", made("export PASSWORD=", PASSWORD)),
+        ("app/x.py", made("key = \"", "qzxvbnmwlprt", "yhgjfdsapoiu\"")),
+    ],
+)
+def test_a_short_password_on_an_added_line_refuses_the_push(path, line):
+    problems = hook.patch_problems(patch(path, [line], new=False))
+    assert any("secret detector" in problem for problem in problems), (path, problems)
+
+
+@pytest.mark.owasp("A07", 259, 798)
+def test_a_password_on_a_later_added_line_of_a_file_is_still_found():
+    lines = ["x = 1", "y = 2", made("password = \"", PASSWORD, "\""), "z = 3"]
+    assert any("secret detector" in problem for problem in hook.patch_problems(patch("app/x.py", lines, new=False)))
+
+
+@pytest.mark.owasp("A07", 259, 798)
+def test_a_find_listed_with_its_file_and_value_does_not_refuse_the_push():
+    line = made("password = \"", PASSWORD, "\"")
+    assert hook.patch_problems(patch("app/x.py", [line], new=False), allowed_detections={("app/x.py", PASSWORD): "made up"}) == []
+    assert hook.patch_problems(patch("app/x.py", [line], new=False), allowed_detections={("app/y.py", PASSWORD): "made up"}) != []
+
+
+@pytest.mark.owasp("A07", 259, 798)
+def test_the_detector_not_being_installed_refuses_the_push_and_says_how_to_install_it(monkeypatch, capsys):
+    for name in [name for name in sys.modules if name == "detect_secrets" or name.startswith("detect_secrets.")]:
+        monkeypatch.setitem(sys.modules, name, None)
+    monkeypatch.setattr(hook, "patch_of_push", lambda local, remote: patch("app/x.py", ["x = 1"], new=False))
+    assert hook.main(io.StringIO("refs/heads/main " + "a" * 40 + " refs/heads/main " + "b" * 40 + "\n")) == 1
+    assert "python -m pip install --require-hashes -r requirements-dev.txt" in capsys.readouterr().err
+
+
+@pytest.mark.owasp("A07", 259, 798)
+def test_a_real_git_push_with_a_short_password_is_refused(pushing_repository):
+    work, remote = pushing_repository
+    assert real_git(work, "push", "origin", "main", check=False).returncode == 0
+    (work / "app" / "x.py").write_text(made("password = \"", PASSWORD, "\"\n"), encoding="utf-8")
+    real_git(work, "commit", "-q", "-am", "oops")
+    refused = real_git(work, "push", "origin", "main", check=False)
+    assert refused.returncode != 0 and "secret detector" in refused.stderr, refused.stderr
+    assert PASSWORD not in refused.stderr  # the message never repeats the value

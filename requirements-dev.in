@@ -20,3 +20,7 @@ pyyaml==6.0.3
 # Checks the application's Python code for calls with the wrong arguments or the wrong kinds of values
 # before it runs (tests/test_type_checking.py).
 mypy==2.4.0
+
+# A second layer for the secrets check (tests/test_detect_secrets_layer.py and the pre-push check): a detector from Yelp that finds
+# password-like values the allowed lists cannot judge. It is a detector, not an allow list, and is used only as an extra layer.
+detect-secrets==1.5.0
