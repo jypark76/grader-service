@@ -98,6 +98,7 @@ A06 646 Reliance on File Name or Extension of Externally-Supplied File
 A06 656 Reliance on Security Through Obscurity
 A06 657 Violation of Secure Design Principles
 A06 676 Use of Potentially Dangerous Function
+A06 799 Improper Control of Interaction Frequency
 A06 807 Reliance on Untrusted Inputs in a Security Decision
 A06 1125 Excessive Attack Surface
 A07 258 Empty Password in Configuration File

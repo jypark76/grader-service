@@ -8,6 +8,7 @@
 # one. Those self-tests need no Kubernetes tools and always run.
 import copy
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,8 +33,9 @@ WORKLOADS = {"Deployment", "Job"}
 # The pods that must run locked down: a normal user, no extra privileges.
 LOCKED_DOWN = {"grader-service", "grader-worker"}
 
-# Things the pods point at that are NOT in the rendered files on purpose. None yet: the grader has no secrets.
-MADE_OUTSIDE: set = set()
+# Things the pods point at that are NOT in the rendered files on purpose: the Secret with the grader's key for the knowledge
+# service is created by hand and never stored in the repo.
+MADE_OUTSIDE = {("Secret", "knowledge-lookup-key")}
 
 
 # In plain English: builds the final Kubernetes files for the laptop settings and
@@ -72,11 +74,6 @@ def assert_secret_file(docs, container, setting, secret_name, key):
     secret = volumes[mount["name"]]["secret"]
     assert secret["secretName"] == secret_name
     assert secret["items"] == [{"key": key, "path": key}]
-
-
-# In plain English: a setting such as DB_PASSWORD_FILE holds the PATH of a mounted Secret file, not a password.
-def is_secret_file_setting(env):
-    return env["name"].endswith("_FILE") and str(env.get("value", "")).startswith("/etc/secrets/")
 
 
 # In plain English: lists every ConfigMap and Secret that a Deployment points at,
@@ -127,13 +124,8 @@ def find_problems(docs):
         if kind not in CLUSTER_WIDE and doc["metadata"].get("namespace") != NAMESPACE:
             problems.append(f"{label}: missing namespace '{NAMESPACE}'")
 
-        # Rule 2: no Secret is ever stored in the repo, not even a template.
-        if kind == "Secret":
-            problems.append(f"{label}: a Secret must never be in the repo")
-
-        # Rule 5: nothing is reachable from outside the cluster.
-        if kind == "Service" and doc["spec"].get("type", "ClusterIP") != "ClusterIP":
-            problems.append(f"{label}: service type must be ClusterIP")
+        # (A Secret in the repo, a Service that is not ClusterIP and a password written into a file are not checked here: the kinds and
+        # settings allowed are listed in tests/allowed_paths.py, and anything else fails tests/test_allowed_manifests.py.)
 
         if kind not in WORKLOADS:
             continue
@@ -142,21 +134,16 @@ def find_problems(docs):
             image = container.get("image", "")
             last_part = image.split("/")[-1]
 
-            # Rule 3: a fixed version tag, never "latest" and never none.
-            if ":" not in last_part:
+            # Rule 3: a fixed version tag. Only a tag that starts with a digit is a version, so "latest", "stable" and no tag at all fail.
+            name_and_tag = last_part.split("@")[0]
+            if ":" not in name_and_tag:
                 problems.append(f"{label}: image '{image}' has no version tag")
-            elif last_part.endswith(":latest"):
-                problems.append(f"{label}: image '{image}' must not use the tag latest")
+            elif not re.fullmatch(r"[0-9][A-Za-z0-9._-]*", name_and_tag.split(":", 1)[1]):
+                problems.append(f"{label}: image '{image}' must have a fixed version tag, which starts with a digit")
 
             # Rule 6: a memory limit, so one pod cannot eat the whole machine.
             if not container.get("resources", {}).get("limits", {}).get("memory"):
                 problems.append(f"{label}: container '{container['name']}' has no memory limit")
-
-            # Rule 8: a password is never written as a plain value in the files. It
-            # has to come from a Secret, because this repo is public.
-            for env in container.get("env", []):
-                if "PASSWORD" in env["name"].upper() and "valueFrom" not in env and not is_secret_file_setting(env):
-                    problems.append(f"{label}: {env['name']} must come from a Secret, not a written value")
 
         # Rule 7: every ConfigMap or Secret a pod points at must exist in the
         # files, or be one of the few things made outside them on purpose.
@@ -212,10 +199,72 @@ def test_real_overlay_breaks_no_rules(real_docs):
     assert find_problems(real_docs) == []
 
 
-# In plain English: the deploy script must never hide errors by sending them to
-# the "bit bucket". That once made a real error look like "Secret missing".
-def test_deploy_script_does_not_hide_errors():
-    assert "/dev/null" not in DEPLOY_SCRIPT.read_text(encoding="utf-8")
+# In plain English: the deploy script may run ONLY these kubectl commands, word for word, and may send output nowhere except to the error
+# stream. So it cannot create or read a Secret, delete anything, or hide an error by sending it to the "bit bucket". Anything else needs
+# a change to this list in a pull request that someone reads.
+ALLOWED_KUBECTL = {
+    "kubectl config current-context",
+    'kubectl kustomize "$here/overlays/$overlay"',
+    'kubectl apply -f "$here/base/namespace.yaml"',
+    "kubectl get secret knowledge-lookup-key -n grader --ignore-not-found -o name",
+    'kubectl apply -k "$here/overlays/$overlay"',
+}
+ALLOWED_REDIRECTS = {">&2"}
+
+
+# In plain English: the kubectl commands a script runs (not the ones it only prints in a message), and every place it sends output.
+def script_commands(text):
+    commands, redirects = [], []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("echo "):
+            if line.startswith("echo "):
+                redirects += re.findall(r"[0-9]*>+&?[0-9]*[^\s\"']*", line.rsplit('"', 1)[-1])
+            continue
+        if "kubectl" in line:
+            command = line[line.index("kubectl"):]
+            command = re.sub(r'\)"?$', "", command)
+            commands.append(command)
+        redirects += re.findall(r"[0-9]*>+&?[0-9]*[^\s\"']*", line)
+    return commands, redirects
+
+
+def script_problems(text):
+    commands, redirects = script_commands(text)
+    problems = [f"runs '{command}'" for command in commands if command not in ALLOWED_KUBECTL]
+    problems += [f"sends output to '{redirect}'" for redirect in redirects if redirect not in ALLOWED_REDIRECTS]
+    return problems
+
+
+def test_the_deploy_script_runs_only_the_listed_kubectl_commands_and_hides_no_errors():
+    text = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert script_problems(text) == []
+    commands, redirects = script_commands(text)
+    assert set(commands) == ALLOWED_KUBECTL  # a listed command nothing runs is a stale allowance
+    assert redirects, "the script reports its refusals on the error stream"
+
+
+BAD_SCRIPT_LINES = {
+    "creating a Secret": "kubectl create secret generic x -n grader --from-literal=key=1",
+    "reading a Secret": "kubectl get secret knowledge-lookup-key -n grader -o yaml",
+    "deleting something": "kubectl delete namespace grader",
+    "applying a file from elsewhere": "kubectl apply -f https://example.com/x.yaml",
+    "applying with a Secret from stdin": "kubectl apply -f - <<< \"$secret\"",
+    "an error sent to the bit bucket": "kubectl get secret knowledge-lookup-key -n grader --ignore-not-found -o name 2>/dev/null",
+    "output sent to a file": "kubectl kustomize \"$here/overlays/$overlay\" > /tmp/out.yaml",
+    "a message sent to the bit bucket": "echo \"x\" 2>/dev/null",
+    "a message sent to the bit bucket another way": "echo \"x\" &>/dev/null",
+    "an error sent to a file": "echo \"x\" 2>>/tmp/errors.txt",
+    "a command that fails quietly": "kubectl config current-context || true",
+    "a command run by another name": "k=kubectl; $k delete pods --all",
+    "a command with another flag": "kubectl apply -k \"$here/overlays/$overlay\" --force",
+}
+
+
+@pytest.mark.parametrize("label", sorted(BAD_SCRIPT_LINES))
+def test_every_other_deploy_script_command_is_refused(label):
+    good = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert script_problems(good + "\n" + BAD_SCRIPT_LINES[label] + "\n") != [], label
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +330,18 @@ def test_catches_a_missing_namespace():
     assert any("missing namespace" in problem for problem in find_problems(docs))
 
 
-def test_catches_a_secret_in_the_repo():
-    docs = good_docs()
-    docs.append({"kind": "Secret", "metadata": {"name": "oops", "namespace": NAMESPACE}})
-    assert any("Secret must never be in the repo" in problem for problem in find_problems(docs))
+def test_catches_a_tag_that_is_not_a_version():
+    for tag in ("stable", "main", "v1", "latest-1", "x1"):
+        docs = good_docs()
+        containers_of(deployment_of(docs))[0]["image"] = f"grader-service:{tag}"
+        assert any("fixed version tag" in problem for problem in find_problems(docs)), tag
+
+
+def test_accepts_a_version_tag_and_a_digest_pinned_one():
+    for image in ("grader-service:0.4.0", "apache/kafka:3.9.0@sha256:" + "a" * 64, "grader-service:1"):
+        docs = good_docs()
+        containers_of(deployment_of(docs))[0]["image"] = image
+        assert find_problems(docs) == [], image
 
 
 def test_catches_the_latest_tag():
@@ -297,13 +354,6 @@ def test_catches_a_missing_tag():
     docs = good_docs()
     containers_of(deployment_of(docs))[0]["image"] = "grader-service"
     assert any("no version tag" in problem for problem in find_problems(docs))
-
-
-@pytest.mark.owasp("A01", 668)
-def test_catches_a_service_open_to_the_outside():
-    docs = good_docs()
-    docs[2]["spec"]["type"] = "NodePort"
-    assert any("ClusterIP" in problem for problem in find_problems(docs))
 
 
 def test_catches_a_missing_memory_limit():
@@ -359,27 +409,6 @@ def test_allows_the_things_made_outside_on_purpose(monkeypatch):
     assert find_problems(docs) == []
 
 
-# In plain English: a password must never be written as a plain value in the files.
-# It has to come from the Kubernetes Secret, because this repo is public.
-
-def test_a_secret_file_path_is_not_mistaken_for_a_written_password():
-    assert is_secret_file_setting({"name": "DB_PASSWORD_FILE", "value": "/etc/secrets/db/app-password"})
-
-
-def test_a_written_password_is_still_caught_even_if_it_is_named_like_a_file_setting():
-    assert not is_secret_file_setting({"name": "DB_PASSWORD_FILE", "value": "hunter2"})
-    assert not is_secret_file_setting({"name": "DB_PASSWORD_FILE", "value": "/tmp/x"})
-    assert not is_secret_file_setting({"name": "DB_PASSWORD", "value": "/etc/secrets/db/app-password"})
-    assert not is_secret_file_setting({"name": "DB_PASSWORD"})
-
-
-def test_catches_a_password_written_in_the_files():
-    docs = good_docs()
-    containers_of(deployment_of(docs))[0]["env"] = [{"name": "SERVICE_PASSWORD", "value": "hunter2"}]
-    problems = find_problems(docs)
-    assert any("PASSWORD" in problem and "Secret" in problem for problem in problems)
-
-
 # In plain English: the worker is its own Deployment from the SAME image as the web side, started with the worker
 # command, and it is held to every pod rule (it is in LOCKED_DOWN). Its only settings come from the ConfigMap, and it
 # holds no secret, so no password or key can sit in its environment.
@@ -390,8 +419,28 @@ def test_the_worker_runs_the_worker_code_from_the_same_image(real_docs):
     assert container["image"] == containers_of(service)[0]["image"]
     assert container["command"] == ["python", "-m", "app.worker"]
     assert container["envFrom"] == [{"configMapRef": {"name": "grader-service-config"}}]
-    assert "env" not in container
-    assert references_of(worker) == {("ConfigMap", "grader-service-config")}
+    assert references_of(worker) == {("ConfigMap", "grader-service-config"), ("Secret", "knowledge-lookup-key")}
+
+
+# In plain English: the grader's key for the knowledge service reaches the worker as a read-only mounted file (never an
+# environment variable), from exactly the named Secret and key, and the address of the knowledge service is a plain setting.
+@pytest.mark.owasp("A02", 526)
+@pytest.mark.owasp("A07", 798)
+def test_the_lookup_key_is_a_mounted_file_and_the_address_is_a_setting(real_docs):
+    worker = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "grader-worker")
+    assert_secret_file(real_docs, containers_of(worker)[0], "KNOWLEDGE_KEY", "knowledge-lookup-key", "key")
+    config = next(d for d in real_docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "grader-service-config")
+    assert config["data"]["KNOWLEDGE_URL"] == "http://knowledge-service.knowledge.svc.cluster.local:8000"
+    assert "KNOWLEDGE_KEY" not in config["data"]
+    web = next(d for d in real_docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "grader-service")
+    assert not any(("secret" in volume) for volume in web["spec"]["template"]["spec"].get("volumes", []))
+
+
+# In plain English: the deploy script checks the key Secret exists and tells you the command if not. It never creates one.
+def test_the_deploy_script_checks_the_lookup_key_and_never_creates_it():
+    lines = [line.strip() for line in DEPLOY_SCRIPT.read_text(encoding="utf-8").splitlines()]
+    assert any(line.startswith("key_secret=") and "get secret knowledge-lookup-key" in line for line in lines)
+    assert not any(line.startswith("kubectl create secret") or line.startswith("kubectl apply -f - ") for line in lines)
 
 
 def test_the_worker_is_held_to_the_pod_rules():

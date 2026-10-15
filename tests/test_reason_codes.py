@@ -12,7 +12,7 @@ from pathlib import Path
 APP = Path(__file__).resolve().parent.parent / "app"
 
 # The reason codes written in platform/contracts/grading-jobs.md. Change this set only together with that file.
-AGREED_REASON_CODES = {"invalid_json", "unknown_schema_version", "invalid_field", "key_mismatch", "grading_refused"}
+AGREED_REASON_CODES = {"invalid_json", "unknown_schema_version", "invalid_field", "key_mismatch", "grading_refused", "lookup_refused"}
 
 
 # In plain English: every text that is the second item of a ("dead_letter", "<text>") pair in the code.

@@ -6,7 +6,7 @@
 # never lose one. Dealt with means one of:
 #   graded       a good job was graded and the answer was delivered to "grading-results" (the delivery is confirmed).
 #   dead_letter  a message that can never succeed (not JSON, unknown version, a broken rule, a key that is not the
-#                submission ID, or a job the grader refuses). It is copied to "grading-jobs.dead-letter" with the
+#                submission ID, a job the grader refuses, or a job the knowledge service refuses for good). It is copied to "grading-jobs.dead-letter" with the
 #                reason in a header, and that copy is confirmed delivered, so it cannot block its lane and a person
 #                can look at it.
 # Temporary trouble (the grader unavailable, Kafka down) is NOT dealt with: nothing is committed, the worker stops
@@ -19,6 +19,7 @@ import os
 import signal
 
 from app.jobs import build_result, read_job
+from app.lookup import KnowledgeLookup, LookupRefused, make_client
 from app.provider import FakeProvider, ProviderRefused
 
 TOPIC = "grading-jobs"
@@ -31,13 +32,20 @@ log = logging.getLogger("grader-worker")
 
 # In plain English: decides what to do with one message and reports the outcome as a pair: ("graded", (key, value))
 # with the answer to send, or ("dead_letter", a reason code). It raises for temporary trouble (such as the grader
-# being unavailable) so the caller does not commit. "provider" is a parameter so tests can pass a pretend one.
-def handle_message(key, value, provider):
+# being unavailable or the knowledge service not answering) so the caller does not commit. "provider" and "lookup" are
+# parameters so tests can pass pretend ones.
+def handle_message(key, value, provider, lookup):
     kind, found = read_job(key, value)
     if kind == "dead_letter":
         return "dead_letter", found
     try:
-        grade = provider.grade(found)
+        examples = lookup(found)  # raises LookupUnavailable on trouble, which must reach the caller: nothing is committed
+    except LookupRefused:
+        # The knowledge service refuses this job for good (a bad request, too large, text it will not take). Trying
+        # again can never help, so the job is dead-lettered and cannot block the jobs behind it.
+        return "dead_letter", "lookup_refused"
+    try:
+        grade = provider.grade(found, examples)
     except ProviderRefused:
         return "dead_letter", "grading_refused"
     try:
@@ -69,7 +77,7 @@ def _deliver(producer, topic, key, value, headers=None):
 # In plain English: the loop. It asks Kafka for one message at a time, deals with it, and only then commits.
 # "consumer", "producer" and "provider" are parameters so tests can pass pretend ones. The loop ends when
 # should_stop() says so. Any error ends it too, after closing the consumer, and the error goes up to the caller.
-def run(consumer, producer, provider, should_stop=lambda: False):
+def run(consumer, producer, provider, lookup, should_stop=lambda: False):
     consumer.subscribe([TOPIC])
     try:
         while not should_stop():
@@ -78,7 +86,7 @@ def run(consumer, producer, provider, should_stop=lambda: False):
                 continue
             if message.error():
                 raise RuntimeError(f"Kafka error: {message.error()}")
-            outcome, detail = handle_message(message.key(), message.value(), provider)
+            outcome, detail = handle_message(message.key(), message.value(), provider, lookup)
             if outcome == "graded":
                 _deliver(producer, RESULT_TOPIC, detail[0], detail[1])
                 reason = None
@@ -129,6 +137,7 @@ def main():
         Consumer(consumer_settings(os.environ)),
         Producer(producer_settings(os.environ)),
         FakeProvider(),
+        KnowledgeLookup(make_client(os.environ)),
         should_stop=lambda: bool(stopping),
     )
 

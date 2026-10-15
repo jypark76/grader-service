@@ -13,8 +13,9 @@ import pytest
 
 from app import worker
 from app.jobs import read_job
+from app.lookup import LookupRefused, LookupUnavailable
 from app.provider import FakeProvider, Grade, ProviderRefused, ProviderUnavailable
-from app.worker import DEAD_LETTER_TOPIC, RESULT_TOPIC, TOPIC, handle_message, run
+from app.worker import DEAD_LETTER_TOPIC, RESULT_TOPIC, TOPIC
 
 
 def good_value(**change):
@@ -34,12 +35,27 @@ def keyed(data):
     return data["submission_id"].encode(), json.dumps(data).encode("utf-8")
 
 
+def no_examples(job):
+    return []
+
+
+# The tests below were written before the lookup existed; these two helpers hand the worker a lookup that finds nothing,
+# unless a test gives its own.
+def handle_message(key, value, provider, lookup=no_examples):
+    return worker.handle_message(key, value, provider, lookup)
+
+
+def run(consumer, producer, provider, should_stop=lambda: False, lookup=no_examples):
+    return worker.run(consumer, producer, provider, lookup, should_stop=should_stop)
+
+
 class Provider:
     def __init__(self, result=None, error=None):
-        self.result, self.error, self.seen = result or Grade("A", "Correct."), error, []
+        self.result, self.error, self.seen, self.examples = result or Grade("A", "Correct."), error, [], []
 
-    def grade(self, job):
+    def grade(self, job, examples=()):
         self.seen.append(job)
+        self.examples.append(list(examples))
         if self.error:
             raise self.error
         return self.result
@@ -114,8 +130,8 @@ def test_the_reason_never_contains_the_student_text():
 
 def test_the_fake_provider_always_gives_the_same_answer_and_never_reads_the_text():
     job = read_job(*keyed(good_value(student_work="STUDENT-MARKER")))[1]
-    grade = FakeProvider().grade(job)
-    assert grade == FakeProvider().grade(job) == Grade("B", "Graded by the fake provider: no AI was used.")
+    grade = FakeProvider().grade(job, [])
+    assert grade == FakeProvider().grade(job, []) == Grade("B", "Graded by the fake provider: no AI was used.")
     assert "STUDENT-MARKER" not in grade.reasoning
 
 
@@ -321,3 +337,99 @@ def test_a_missing_bootstrap_setting_stops_early(environment):
         worker.consumer_settings(environment)
     with pytest.raises(RuntimeError):
         worker.producer_settings(environment)
+
+
+# ---------- The knowledge-service lookup inside the worker ----------
+
+class Lookup:
+    def __init__(self, examples=(), error=None):
+        self.examples, self.error, self.calls = list(examples), error, []
+
+    def __call__(self, job):
+        self.calls.append(job)
+        if self.error:
+            raise self.error
+        return self.examples
+
+
+def never_lookup():
+    return Lookup(error=AssertionError("a bad message must never reach the lookup"))
+
+
+def test_a_good_job_is_looked_up_once_and_the_examples_go_to_the_grader():
+    data = good_value()
+    lookup, provider = Lookup(["example-1", "example-2"]), Provider()
+    assert handle_message(*keyed(data), provider, lookup)[0] == "graded"
+    assert len(lookup.calls) == 1 and str(lookup.calls[0].submission_id) == data["submission_id"]
+    assert provider.examples == [["example-1", "example-2"]]
+
+
+@pytest.mark.owasp("A05", 20)
+@pytest.mark.parametrize("value", [b"{not json", json.dumps(good_value(rubric="")).encode(), json.dumps(good_value(student_name="Ann")).encode()])
+def test_a_bad_message_never_reaches_the_lookup(value):
+    assert handle_message(b"k", value, never_grade(), never_lookup())[0] == "dead_letter"
+
+
+@pytest.mark.owasp("A10", 252, 394, 754)
+def test_the_lookup_being_unavailable_is_not_swallowed_and_the_grader_is_never_asked():
+    provider = Provider()
+    with pytest.raises(LookupUnavailable):
+        handle_message(*keyed(good_value()), provider, Lookup(error=LookupUnavailable("down")))
+    assert provider.seen == []
+
+
+@pytest.mark.owasp("A10", 252, 394, 754)
+def test_the_lookup_being_unavailable_means_no_commit_no_answer_and_the_loop_stops():
+    log = []
+    fake = FakeConsumer([FakeMessage(*keyed(good_value()), 3)], log)
+    with pytest.raises(LookupUnavailable):
+        run(fake, FakeProducer(log), Provider(), should_stop=lambda: False, lookup=Lookup(error=LookupUnavailable("down")))
+    assert log == []
+    assert fake.closed
+
+
+@pytest.mark.owasp("A02", 526)
+@pytest.mark.owasp("A07", 798)
+def test_a_missing_lookup_key_stops_the_worker_without_a_commit():
+    log = []
+    fake = FakeConsumer([FakeMessage(*keyed(good_value()), 3)], log)
+    with pytest.raises(RuntimeError):
+        run(fake, FakeProducer(log), Provider(), should_stop=lambda: False, lookup=Lookup(error=RuntimeError("Missing required setting: KNOWLEDGE_KEY")))
+    assert log == [] and fake.closed
+
+
+# ---------- A job the knowledge service refuses for good ----------
+
+@pytest.mark.owasp("A10", 252, 754)
+def test_a_job_the_knowledge_service_refuses_for_good_is_dead_lettered_and_the_grader_is_never_asked():
+    provider = Provider()
+    assert handle_message(*keyed(good_value()), provider, Lookup(error=LookupRefused("refused"))) == ("dead_letter", "lookup_refused")
+    assert provider.seen == []
+
+
+@pytest.mark.owasp("A10", 252, 754)
+def test_a_refused_job_is_copied_to_the_dead_letter_topic_then_committed_so_it_cannot_block_its_lane():
+    data = good_value()
+    log = []
+    fake = FakeConsumer([FakeMessage(*keyed(data), 4), FakeMessage(*keyed(good_value()), 5)], log)
+    outcomes = iter([LookupRefused("refused"), None])
+
+    def lookup(job):
+        error = next(outcomes)
+        if error:
+            raise error
+        return []
+
+    run(fake, FakeProducer(log), Provider(), should_stop=lambda: not fake.messages, lookup=lookup)
+    kinds = [(entry[0], entry[1]) if entry[0] == "produce" else entry for entry in log]
+    assert kinds == [("produce", DEAD_LETTER_TOPIC), ("flush",), ("commit", 4), ("produce", RESULT_TOPIC), ("flush",), ("commit", 5)]
+    assert dict(log[0][4])["error"] == b"lookup_refused"
+
+
+@pytest.mark.owasp("A10", 252, 394)
+def test_a_wrong_key_still_stops_the_worker_it_is_not_dead_lettered():
+    log = []
+    fake = FakeConsumer([FakeMessage(*keyed(good_value()), 3)], log)
+    with pytest.raises(LookupUnavailable):
+        run(fake, FakeProducer(log), Provider(), should_stop=lambda: False, lookup=Lookup(error=LookupUnavailable("the lookup answered with status 401")))
+    assert log == [] and fake.closed

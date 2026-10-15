@@ -8,8 +8,8 @@
 # That last rule is the safety net: laptop settings can never be applied to a
 # real cluster by accident, or the other way round.
 #
-# It never creates or reads passwords. The grader has no secrets yet; the first ones arrive with the Kafka
-# reader, and this script will then check for them the way the other services' scripts do.
+# It never creates or reads passwords. The Secret that holds the grader's key for the knowledge service must already
+# exist; if it does not, the script tells you the command to type and stops.
 #
 # Usage:  bash k8s/deploy.sh            (deploy)
 #         bash k8s/deploy.sh --preview  (only show what would be deployed)
@@ -59,5 +59,15 @@ fi
 
 # Make sure the "grader" room exists first.
 kubectl apply -f "$here/base/namespace.yaml"
+
+# The grader's key for the knowledge service must already exist in the cluster. The script never creates or reads it.
+# "--ignore-not-found" means a missing Secret gives an empty answer, while any other problem (no connection, expired
+# login, no permission) shows its real error and stops the script.
+key_secret="$(kubectl get secret knowledge-lookup-key -n grader --ignore-not-found -o name)"
+if [ -z "$key_secret" ]; then
+  echo "The Secret 'knowledge-lookup-key' does not exist yet. Create it first, with the grader's key for the knowledge service:" >&2
+  echo "  kubectl create secret generic knowledge-lookup-key -n grader --from-literal=key=THE_GRADER_KEY" >&2
+  exit 1
+fi
 
 kubectl apply -k "$here/overlays/$overlay"

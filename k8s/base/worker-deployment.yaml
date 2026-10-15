@@ -32,6 +32,15 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi
+        # The grader's key for the knowledge service, mounted as a read-only file. The Secret is made by hand and never
+        # stored in the repo.
+        - name: knowledge-key
+          secret:
+            secretName: knowledge-lookup-key
+            defaultMode: 0440
+            items:
+              - key: key
+                path: key
       containers:
         - name: grader-worker
           # The same image as the web side; the version tag is added by each overlay.
@@ -40,11 +49,19 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: knowledge-key
+              mountPath: /etc/secrets/knowledge-key
+              readOnly: true
           command: ["python", "-m", "app.worker"]
-          # Non-secret settings (KAFKA_BOOTSTRAP) come from the ConfigMap that each overlay supplies.
+          # Non-secret settings (KAFKA_BOOTSTRAP, KNOWLEDGE_URL) come from the ConfigMap that each overlay supplies.
           envFrom:
             - configMapRef:
                 name: grader-service-config
+          env:
+            # KNOWLEDGE_KEY is read from a file that Kubernetes mounts from the Secret (see app/secret_files.py), not
+            # passed as an environment variable.
+            - name: KNOWLEDGE_KEY_FILE
+              value: /etc/secrets/knowledge-key/key
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

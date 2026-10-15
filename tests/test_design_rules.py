@@ -13,7 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "design-rules.md"
-MINIMUM_RULES = 22
+MINIMUM_RULES = 34
 TEST_REFERENCE = re.compile(r"`(tests/[a-z0-9_]+\.py)::([A-Za-z0-9_]+)`")
 
 
@@ -58,7 +58,7 @@ def test_every_design_rule_names_a_test_that_exists():
 @pytest.mark.owasp("A06", 657)
 def test_the_rules_cover_the_agreed_principles():
     text = DOC.read_text(encoding="utf-8").lower()
-    for principle in ("minimal surface", "documentation closed", "labelled replies", "no default secrets", "secrets as files", "reveal nothing", "internal only", "hardened pods", "pinned supply chain", "pinned images", "reviewed cryptography", "no dangerous functions", "checked calls", "settings fixed at deploy", "no uploads", "no file access", "no database", "fixed destinations", "strict messages", "done only after delivery", "never lose a job", "no student text in logs"):
+    for principle in ("minimal surface", "documentation closed", "labelled replies", "no default secrets", "secrets as files", "reveal nothing", "internal only", "hardened pods", "pinned supply chain", "pinned images", "reviewed cryptography", "no dangerous functions", "checked calls", "settings fixed at deploy", "no uploads", "no file access", "no database", "fixed destinations", "strict messages", "done only after delivery", "never lose a job", "no student text in logs", "one fixed destination", "no redirects", "untrusted replies", "lookup failure stops the worker", "key never logged"):
         assert principle in text, principle
 
 

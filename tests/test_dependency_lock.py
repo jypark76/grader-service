@@ -20,7 +20,24 @@ LOCKS = [name for name in ("requirements.txt", "requirements-dev.txt", "requirem
 INPUTS = {lock: lock.replace(".txt", ".in") for lock in LOCKS}
 
 HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
-PIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?==[A-Za-z0-9.!+_-]+( ;.*)?$")
+# The ONE allowed shape of a requirement: a name, optional extras, == and one exact version, and optionally "; " followed by plain
+# conditions such as python_full_version < '3.13' joined by "and" or "or". Nothing else is allowed, so a web address, a git or file
+# source, a bare option, a range such as >=, or a condition holding anything unusual all fail.
+CLAUSE = r"[a-z_]+ (?:==|!=|<=|>=|<|>) '[A-Za-z0-9._-]+'"
+PIN = re.compile(rf"[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?==[A-Za-z0-9.!+_]+( ; {CLAUSE}( (?:and|or) {CLAUSE})*)?$")
+
+
+# In plain English: what is wrong with one lock entry (its requirement text and its hashes), as plain sentences.
+def entry_problems(entry):
+    requirement, hashes = split_entry(entry)
+    problems = []
+    if not PIN.match(requirement):
+        problems.append(f"'{requirement}' is not one exact version (name==version, with plain conditions only)")
+    if not hashes:
+        problems.append(f"'{requirement}' has no hash")
+    if len(set(hashes)) != len(hashes):
+        problems.append(f"'{requirement}' repeats a hash")
+    return problems
 
 
 # In plain English: reads a requirements file and returns its real entries as (text before the hashes,
@@ -57,25 +74,59 @@ def test_there_is_a_lock_file_to_check():
 
 @pytest.mark.owasp("A03", 1357)
 @pytest.mark.parametrize("lock", LOCKS)
-def test_every_library_in_a_lock_is_pinned_exactly_and_has_hashes(lock):
+def test_every_library_in_a_lock_is_pinned_exactly_has_hashes_and_comes_from_nowhere_else(lock):
     entries = read_entries(ROOT / lock)
     assert entries, f"{lock} is empty"
     for entry in entries:
-        requirement, hashes = split_entry(entry)
-        assert PIN.match(requirement), f"{lock}: '{requirement}' is not pinned to one exact version with =="
-        assert hashes, f"{lock}: '{requirement}' has no hash"
-        assert len(set(hashes)) == len(hashes), f"{lock}: '{requirement}' repeats a hash"
+        assert entry_problems(entry) == [], f"{lock}: {entry_problems(entry)}"
+
+
+HASH_A = "--hash=sha256:" + "a" * 64
+HASH_B = "--hash=sha256:" + "b" * 64
+GOOD_ENTRIES = {
+    "a plain pin": f"annotated-types==0.7.0 {HASH_A}",
+    "a pin with extras": f"uvicorn[standard]==0.46.0 {HASH_A} {HASH_B}",
+    "a pin with a condition": f"colorama==0.4.6 ; sys_platform == 'win32' {HASH_A}",
+    "a pin with two conditions": f"librt==0.16.0 ; platform_python_implementation != 'PyPy' and python_full_version < '3.13' {HASH_A}",
+}
+BAD_ENTRIES = {
+    "a web address": f"requests @ https://example.com/requests.tar.gz {HASH_A}",
+    "a web address in the version": f"requests==https://example.com/x {HASH_A}",
+    "a git source": f"git+https://github.com/x/y.git {HASH_A}",
+    "a git source with a name": f"y @ git+https://github.com/x/y.git {HASH_A}",
+    "a file source": f"y @ file:///tmp/y.whl {HASH_A}",
+    "a local path": f"./y {HASH_A}",
+    "an editable install": f"-e . {HASH_A}",
+    "another download site": f"--index-url https://example.com/simple {HASH_A}",
+    "an extra download site": f"--extra-index-url https://example.com/simple {HASH_A}",
+    "a find-links line": f"--find-links https://example.com {HASH_A}",
+    "a web address as the name": f"https://example.com/x==1.0 {HASH_A}",
+    "a name with a space": f"re quests==2.0.0 {HASH_A}",
+    "a name with a command": f"requests;rm==2.0.0 {HASH_A}",
+    "a name starting with a dash": f"-requests==2.0.0 {HASH_A}",
+    "text after the version": f"requests==2.0.0 and more {HASH_A}",
+    "a range": f"requests>=2.0 {HASH_A}",
+    "a compatible release": f"requests~=2.0 {HASH_A}",
+    "no version": f"requests {HASH_A}",
+    "a wildcard version": f"requests==2.* {HASH_A}",
+    "no hash": "requests==2.0.0",
+    "a repeated hash": f"requests==2.0.0 {HASH_A} {HASH_A}",
+    "a condition holding an address": f"requests==2.0.0 ; python_version < 'https://x' {HASH_A}",
+    "a condition that is not a comparison": f"requests==2.0.0 ; os.system('x') {HASH_A}",
+    "a condition with a quote and a command": f"requests==2.0.0 ; sys_platform == 'win32' and __import__('os') {HASH_A}",
+}
 
 
 @pytest.mark.owasp("A03", 1357)
-@pytest.mark.parametrize("lock", LOCKS)
-def test_a_lock_cannot_pull_from_anywhere_else(lock):
-    # No other download site, no links to files or repositories, no editable installs, no stray options.
-    for entry in read_entries(ROOT / lock):
-        assert not entry.startswith("-"), f"{lock}: option line '{entry[:60]}'"
-        requirement = split_entry(entry)[0]
-        for forbidden in ("://", " @ ", "git+", "file:", "index-url", "find-links"):
-            assert forbidden not in requirement, f"{lock}: '{requirement}'"
+@pytest.mark.parametrize("label", sorted(GOOD_ENTRIES))
+def test_a_good_lock_entry_passes(label):
+    assert entry_problems(GOOD_ENTRIES[label]) == []
+
+
+@pytest.mark.owasp("A03", 1357)
+@pytest.mark.parametrize("label", sorted(BAD_ENTRIES))
+def test_every_bad_lock_entry_is_refused(label):
+    assert entry_problems(BAD_ENTRIES[label]) != []
 
 
 @pytest.mark.owasp("A03", 1357)
@@ -166,30 +217,13 @@ def test_the_audit_runs_on_every_pull_request_on_main_and_every_week():
 
 
 @pytest.mark.owasp("A03", 1035, 1395)
-def test_the_audit_checks_every_lock_file_with_the_strict_flags():
+def test_the_audit_checks_every_lock_file_there_is():
+    # The exact audit steps are pinned in tests/test_supply_chain_pins.py; this ties them to the lock files that really exist.
     _, document = audit_workflow()
-    commands = audit_commands(document)
     audited = set()
-    for command in commands:
-        assert command.startswith("pip-audit "), command
-        for flag in ("--require-hashes", "--disable-pip", "--strict"):
-            assert flag in command, (flag, command)
+    for command in audit_commands(document):
         audited.update(re.findall(r"-r (\S+)", command))
     assert audited == set(LOCKS), f"audited {sorted(audited)} but the locks are {sorted(LOCKS)}"
-
-
-@pytest.mark.owasp("A03", 1035, 1395)
-def test_the_audit_can_never_pass_by_doing_nothing_or_failing_quietly():
-    text, document = audit_workflow()
-    assert "continue-on-error" not in text
-    assert "|| true" not in text and "||true" not in text
-    assert "set +e" not in text
-    for job in document["jobs"].values():
-        assert "if" not in job and "continue-on-error" not in job
-        for step in job["steps"]:
-            assert "if" not in step, step  # no step may be switched off by a condition
-            assert "continue-on-error" not in step
-    assert audit_commands(document), "the workflow runs no pip-audit command"
 
 
 @pytest.mark.owasp("A03", 1035, 1395)
